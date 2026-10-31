@@ -1,0 +1,919 @@
+"""decision3/charts.py — v2.2 charts (Abhi ✔ साठी). Chart वरचा सगळा मजकूर English (Abhi: chart वर मराठी नको; Telegram caption `story` मराठी): W+D (Dow swings, trend, protected, range) आणि 1H (D2 swings, जिवंत levels ★,
+active levels). फक्त दाखवण्यासाठी — निर्णयात नाही. Order / broker call नाही."""
+import io
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+from . import flip as FL  # noqa: E402
+from . import levels as LV  # noqa: E402
+from . import settings as S3  # noqa: E402
+from . import method as M  # noqa: E402
+from . import volume_pane as VP  # noqa: E402
+
+TREND_COLOR = {"UP": "#d8f3dc", "DOWN": "#ffd6d6", "RANGE": "#fff3bf", "NEUTRAL": "#eeeeee", "UNKNOWN": "#ffffff"}
+
+
+def _candles(ax, df):
+    for i, r in enumerate(df.itertuples()):
+        up = r.close >= r.open
+        col = "#2b8a3e" if up else "#c92a2a"
+        ax.plot([i, i], [r.low, r.high], color=col, lw=0.8)
+        ax.add_patch(plt.Rectangle((i - 0.3, min(r.open, r.close)), 0.6, max(abs(r.close - r.open), 1e-6), color=col))
+    ax.set_xlim(-1, len(df))
+
+
+def _xticks(ax, ts, every):
+    idx = list(range(0, len(ts), max(1, every)))
+    ax.set_xticks(idx)
+    ax.set_xticklabels([pd.Timestamp(ts[i]).strftime("%d %b") for i in idx], rotation=45, fontsize=7)
+
+
+def _png(fig):
+    b = io.BytesIO()
+    fig.savefig(b, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return b.getvalue()
+
+
+def _why_en(st):
+    """Chart वर फक्त English (Abhi): Daily state चं कारण."""
+    p = st.protected
+    if st.trend in ("UP", "DOWN") and p is not None and getattr(st, "phase", None):
+        ph = {"impulse": "impulse", "correction": f"correction leg {st.corr_label}",
+              "origin_broken": "origin closed through - waiting for opposite impulse"}[st.phase]
+        return f" · {ph} · protected origin {p.price:,.0f}" + (" · MATURE near target" if st.mature else "")
+    if st.trend in ("UP", "DOWN") and p is not None:
+        return f" · protected {'HL' if p.kind == 'L' else 'LH'} {p.price:,.0f}"
+    if st.trend == "NEUTRAL" and p is not None:
+        return f" · protected {'HL' if p.kind == 'L' else 'LH'} {p.price:,.0f} broken by daily close"
+    if st.trend == "RANGE" and st.band:
+        return f" · range {st.band[0]:,.0f}-{st.band[1]:,.0f}"
+    if st.trend == "UNKNOWN":
+        return " · not enough daily data"
+    return ""
+
+
+def _vol_axes(figsize, ratio=(4, 1)):
+    """Price ax + त्याखाली volume pane (एकच x)."""
+    fig, (ax, axv) = plt.subplots(2, 1, figsize=figsize, sharex=True, gridspec_kw={"height_ratios": list(ratio), "hspace": 0.04})
+    return fig, ax, axv
+
+
+def _col(df, name, symbol=None):
+    """Bars चा स्वतःचा volume — index (spot) चा कधीच नाही (तो FUT म्हणून दाखवला जाऊ नये) ⇒ NaN."""
+    if VP.is_index(symbol) or name not in df.columns:
+        return np.full(len(df), np.nan)
+    return df[name].to_numpy(float)
+
+
+def daily_png(daily_df, states, title, upto=None, start=0, symbol=None, vol=None):
+    """Daily: candles, trend पार्श्वभूमी, confirmed swings (HH/HL/LH/LL), protected रेघ, range पट्टा. start ⇒ फक्त त्या index पासून
+    दाखवतो (engine पूर्ण history वर; Q33: NIFTY holdout तारखा chart वर नाहीत)."""
+    d = daily_df.reset_index(drop=True)
+    n = len(d) if upto is None else upto + 1
+    if int(start) > n - 1:
+        raise ValueError("daily_png: no daily candle to show after start (sealed or not enough data)")
+    start = max(0, int(start))
+    d = d.iloc[start:n]
+    fig, ax, axv = _vol_axes((12, 6.2))
+    for i in range(start, n):
+        ax.axvspan(i - start - 0.5, i - start + 0.5, color=TREND_COLOR.get(states[i].trend, "#fff"), lw=0)
+    _candles(ax, d)
+    last = states[n - 1]
+    from . import daily_swings as DS
+    shown = [p for p in last.pivots if p.bar >= start]
+    full = daily_df.reset_index(drop=True)                                 # F1: structure labels (same degree), C-13 equal
+    tags = DS.tag_pivots(last.pivots, full["open"].to_numpy(float), full["close"].to_numpy(float))
+    for p, lab in zip(last.pivots, tags):
+        if p.bar >= start:
+            ax.annotate(lab, (p.bar - start, p.price), textcoords="offset points", xytext=(0, 8 if p.kind == "H" else -12), ha="center",
+                        fontsize=8, color="#1c7ed6" if p.kind == "H" else "#e8590c")
+    if shown:
+        ax.plot([p.bar - start for p in shown], [p.price for p in shown], color="#495057", lw=0.8, ls="--")
+    if last.protected is not None:
+        ax.axhline(last.protected.price, color="#7048e8", lw=1.2, ls=":")
+        ax.text(n - start - 0.5, last.protected.price, f" protected {last.protected.price:,.0f}", color="#7048e8", fontsize=8, va="bottom")
+    if last.band:
+        ax.axhspan(last.band[0], last.band[1], color="#fab005", alpha=0.15)
+    for x in getattr(last, "targets", ()) or ():                               # Q44 structural target (parent नंतरच्या पहिल्या impulse leg चं टोक)
+        ax.axhline(x, color="#868e96", lw=0.8, ls="--")
+        ax.text(n - start - 0.5, x, f" target {x:,.0f}", color="#868e96", fontsize=7, va="top")
+    ax.set_title(f"{title} · Daily trend {last.trend}" + _why_en(last), fontsize=10)
+    vv = np.asarray(vol, dtype=float)[start:n] if vol is not None else _col(d, "volume", symbol or title)   # index ⇒ futures vol द्यावा
+    VP.draw_daily_mpl(axv, vv, source=VP.source_label(symbol or title), partial_last=False)   # volume नाही ⇒ NA
+    _xticks(axv, d["timestamp"].to_numpy(), max(1, (n - start) // 15))
+    return _png(fig)
+
+
+def weekly_png(daily_df, title):
+    """Weekly: फक्त संदर्भ (gate नाही)."""
+    d = daily_df.copy()
+    wk = pd.to_datetime(d["timestamp"]).dt.to_period("W-FRI")
+    w = d.assign(_w=wk).groupby("_w").agg(timestamp=("timestamp", "first"), open=("open", "first"), high=("high", "max"),
+                                          low=("low", "min"), close=("close", "last")).reset_index(drop=True)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    _candles(ax, w)
+    ax.set_title(f"{title} · Weekly (context only)", fontsize=10)
+    _xticks(ax, w["timestamp"].to_numpy(), max(1, len(w) // 10))
+    return _png(fig)
+
+
+MAX_LEVEL_BANDS = 6                                                        # C1 (Abhi): review charts वर कमाल 6 level पट्टे (debug बाहेर आता TA4: 3 वर + 3 खाली)
+
+
+def band_view(lv, t, shown, act, debug=False):
+    """TA1 / TA4 (Abhi, design §10) — drawing layer only, the decision is unchanged: the shared band check (facts/validity.py via
+    decision3.levels.check_bands) on each level band, on the 1H bars up to t (the running hour only up to t). Returns
+    [(level, facts, style)] with style "valid" / "broken" (the most recent broken one, dashed) / "active" (the engine's active level,
+    valid but outside the 3 + 3 view — still drawn) / "decision" (the engine's active level that fails the check — still drawn,
+    labelled with the reasons, because it is the level the decision used). ≤ 3 valid above and ≤ 3 below price. Band check window =
+    the 1H lookback (design §5, 15 sessions).
+    debug=True: every level with its facts (style "debug")."""
+    from atp_private.trade_engine.facts import validity as FV
+    j_end = int(lv.h1_of[t])
+    fr = lv.h1.iloc[:j_end + 1].reset_index(drop=True)
+    fr.loc[len(fr) - 1, ["open", "high", "low", "close"]] = list(lv._h1_upto(j_end, t))
+    checked = LV.check_bands(fr, len(fr) - 1, shown, FV.lookback("1H"), magnet_df=lv.m15.iloc[:t + 1])
+    if debug:
+        return [(x, f, "debug") for x, f in checked]
+    facts = [f for _, f in checked]
+    pick = {id(f) for f in FV.select_bands(facts, float(fr["close"].iloc[-1]))}
+    out = []
+    for x, f in checked:
+        if id(f) in pick:
+            out.append((x, f, "valid" if f["valid"] else "broken"))
+        elif x["id"] in act:
+            out.append((x, f, "active" if f["valid"] else "decision"))
+    return out
+
+
+MAX_BANDS_PER_SIDE = 3                                                     # P8 / TA4 display: ≤ 3 areas above and ≤ 3 below price
+
+
+def method_band_view(lv, t, shown, act, debug=False):
+    """Layer 6b (Abhi's method, P8): the areas the 1H chart draws are the DECISION's own (`Levels.snapshot`: one base, wick to body, K4
+    state) — nothing re-checked by a display finder. Every armed area (the decision's watch list) is drawn; of the others the nearest
+    ≤ 3 above and ≤ 3 below price that are trade locations (not BROKEN), plus the most recently broken one (dashed). Returns
+    [(area, style)] with style "armed" / "area" / "broken". debug=True: every area shown (style "debug")."""
+    if debug:
+        return [(x, "debug") for x in shown]
+    out, seen = [], set()
+    for x in shown:
+        if x["id"] in act:
+            out.append((x, "armed"))
+            seen.add(x["id"])
+    rest = [x for x in shown if x["id"] not in seen and x.get("trade_location", True)]
+    live = [x for x in rest if x.get("state") not in (FL.BROKEN, FL.BEYOND)]
+    for side in ("above", "below"):
+        for x in sorted((x for x in live if x.get(side)), key=lambda x: x["dist"])[:MAX_BANDS_PER_SIDE]:
+            out.append((x, "area"))
+    inside = [x for x in live if not x.get("above") and not x.get("below")]
+    out += [(x, "area") for x in inside]
+    broken = sorted((x for x in rest if x.get("state") in (FL.BROKEN, FL.BEYOND)), key=lambda x: x.get("broken_at") or -1)
+    if broken:
+        out.append((broken[-1], "broken"))
+    return out
+
+
+def area_label(x, armed=False):
+    """Chart label (English) of an area as the method reads it: role, low-high, K4 state, tests / sweeps, confluence (+ line touch N)."""
+    role = {"resistance": "supply", "support": "demand"}.get(x.get("role"), "area")
+    bits = [str(x.get("state") or "ACTIVE").lower()]
+    if x.get("tests"):
+        bits.append(f"{x['tests']} test" + ("s" if x["tests"] > 1 else ""))
+    if x.get("sweeps"):
+        bits.append("swept")
+    if x.get("z"):                                                         # Z5 (M7): zone (form, departure) / level
+        from . import zones_z as ZZ
+        bits.append(ZZ.label(x["z"]))
+    return f"{'> ' if armed else ''}{LV.tf_word(x)} {role} {x['lo']:,.0f}-{x['hi']:,.0f} ({', '.join(bits)}{LV.level_tags(x)})"
+
+
+def _trend_line(lv, t, trend):
+    """Layer 4 line on the trend side (`trendline.swing_line`: two separate reactions of the structure, touches by reactions) and its
+    reaction touch (`reaction_touch`: touch N) — the line the decision labels areas with. None when there is none."""
+    from types import SimpleNamespace
+    from . import trendline as TL
+    if trend not in ("UP", "DOWN"):
+        return None, None
+    V = SimpleNamespace(levels=lv, s=lv.s)
+    d = TL.UP if trend == "UP" else TL.DOWN
+    ln = TL.swing_line(V, t, d)
+    return (ln, TL.reaction_touch(V, t, d, ln)) if ln is not None else (None, None)
+
+
+def h1_png(lv, t, trend, title, sessions=8, max_sigma=None, liq=None, band=None, debug=False, finder="method", chart_objects="off",
+           objects=None, story=None):
+    """1H: candles of the last `sessions` sessions (up to t), the areas and the highlighted trigger candle. finder "method" (default,
+    layer 6b): the decision's own areas with their K4 state (`method_band_view`) and the trend-side line with its touch number — nothing
+    the method does not read. finder "validity" (legacy, R1a): the level bands that pass the shared band check (TA1 / TA4: ≤ 3 above
+    and ≤ 3 below price, the most recent broken one dashed, the active level always; label: role, price, touch count). debug=True: all
+    nearby levels (births, sweeps, tests, band-check reasons), D2 swings and liquidity marks.
+    chart_objects "on" (PA standard §4, display setting, default "off" = today's chart byte for byte): the ONE object list
+    (decision3.draw_objects — `objects`, else collected at t) is drawn instead of the method areas / line, the same list the Telegram
+    chart draws; story = the per-timeframe reader story lines (draw_objects.tf_story) printed under the chart."""
+    if chart_objects not in ("off", "on"):
+        raise ValueError(f"h1_png: chart_objects {chart_objects!r} — off / on")
+    h1, h1_of = lv.h1, lv.h1_of
+    j_end = int(h1_of[t])
+    days = pd.to_datetime(h1["timestamp"]).dt.normalize()
+    keep_days = sorted(days.iloc[:j_end + 1].unique())[-sessions:]
+    j0 = int(np.flatnonzero(days.isin(keep_days).to_numpy())[0])
+    frame = h1.iloc[j0:j_end + 1].reset_index(drop=True)
+    o, hh, ll, cc = lv._h1_upto(j_end, t)                                      # चालू (अपूर्ण) तास: फक्त t पर्यंतचे bars
+    frame.loc[len(frame) - 1, ["open", "high", "low", "close"]] = [o, hh, ll, cc]
+    fig, ax = plt.subplots(figsize=(13, 6))
+    _candles(ax, frame)
+    sg = lv.sig1h[t]
+    lim = (max_sigma or float(lv.s["show_distance_sigma"])) * (sg if np.isfinite(sg) else np.inf)
+    act = {x["id"] for x in lv.active(t, trend, band)}                    # Q27: engine ② सारखाच पट्टा
+    shown = [x for x in lv.snapshot(t) if x["dist"] <= lim or x["id"] in act]   # दूरची levels chart वर लपवा (snapshot मध्ये आहेत)
+    if chart_objects == "on":
+        _objects_panel(ax, lv.h1["timestamp"].iloc[:j_end + 1], j0, frame, _objects_at(lv, t, trend, objects, sessions),
+                       min_degree=int(lv.s.get("level_degree", 2)), ctx={"setup_tf": "1H"})
+        view = []
+    elif finder == "method":
+        _h1_method(ax, lv, t, trend, frame, j0, shown, act, debug)
+        view = []
+    elif finder == "validity":
+        view = band_view(lv, t, shown, act, debug) if shown else []
+    else:
+        raise ValueError(f"h1_png: finder {finder!r} — method / validity")
+    for x, f, style in view:
+        col = "#2f9e44" if x["role"] == LV.SUP else "#e03131"
+        if style == "broken":
+            ax.axhspan(x["lo"], x["hi"], facecolor="none", edgecolor="#868e96", ls="--", lw=1.0)
+        else:
+            ax.axhspan(x["lo"], x["hi"], color=col, alpha=0.30 if x["id"] in act else 0.10, lw=0)
+        if debug:
+            lab = f"{'▶ ' if x['id'] in act else ''}{x['role'][:3]} {'+'.join(x['births'])} {'★' * x['sweeps']} t{x['tests']}" + \
+                f" [{'valid' if f['valid'] else ','.join(f['reasons'])}, T{f['touch_count']}]"
+        else:
+            st = {"valid": f"{f['touch_count']} touches" + (", established" if f["established"] else ""), "broken": "broken",
+                  "active": f"{f['touch_count']} touches, active level outside the 3 + 3 view",
+                  "decision": "fails band check: " + ", ".join(f["reasons"])}[style]
+            lab = f"{'▶ ' if x['id'] in act else ''}{x['role'].lower()} {x['lo']:,.0f}-{x['hi']:,.0f} ({st}{LV.level_tags(x)})"
+        ax.text(len(frame) - 0.5, (x["lo"] + x["hi"]) / 2, " " + lab, fontsize=7, color="#868e96" if style == "broken" else col, va="center")
+    ax.axvspan(len(frame) - 1.5, len(frame) - 0.5, color="#fab005", alpha=0.18, lw=0)   # C1: trigger candle (चालू तास)
+    for q in (liq or ()) if debug else ():                                                        # §7.6 liquidity pools (BSL वर / SSL खाली) — लहान खुणा
+        col = "#1971c2" if q["side"] == "buy" else "#c2255c"
+        ax.plot([len(frame) - 3, len(frame) - 0.5], [q["price"], q["price"]], color=col, lw=1.0, ls=(0, (1, 1)))
+        ax.text(len(frame) - 3, q["price"], f"{q['label']} {q['price']:,.0f} ", color=col, fontsize=6, va="bottom", ha="right")
+    for p in (lv.piv if debug else ()):
+        if p.confirm_bar <= t:
+            j = int(h1_of[p.bar]) - j0
+            if 0 <= j < len(frame):
+                ax.plot(j, p.price, marker="v" if p.kind == "H" else "^", color="#1c7ed6" if p.kind == "H" else "#e8590c", ms=6)
+    ax.set_title(f"{title} · 1H · Daily {trend} · {str(pd.Timestamp(lv.m15['timestamp'].iloc[t]))[:16]}", fontsize=10)
+    _xticks(ax, frame["timestamp"].to_numpy(), max(1, len(frame) // 12))
+    if story:
+        _story_box(fig, story)
+    return _png(fig)
+
+
+def _objects_at(V, t, trend, objects, sessions=8):
+    """PA §4: the given object list, else the one collected at t (decision3.draw_objects.collect, the same window as the chart)."""
+    from . import draw_objects as DO
+    if objects is not None:
+        return DO.clean(objects)[0]
+    return DO.collect(V, t, trend=trend, since=DO.window_start(V, t, sessions))
+
+
+def _objects_panel(ax, starts, j0, frame, objects, min_degree=None, ylim=None, exclude=None, ctx=None, max_lines=None):
+    """PA §4: draw the object list on one matplotlib price panel (decision3.draw_render: the same geometry as the Telegram chart).
+    starts = the bar start times of this panel's timeframe up to its last bar; j0 = index of the first bar shown. P8 clean charts:
+    decision3.chart_lines.select picks the lines shown (cap = `chart_max_lines`, display); the rest are listed as "hidden: N"."""
+    from . import chart_lines as CL
+    from . import draw_render as DR
+    objs = [o for o in objects if not (exclude and exclude(o))]
+    n_max = int(max_lines if max_lines is not None else CL.max_lines_default())
+    bars = frame[["timestamp", "high", "low", "close"]] if "timestamp" in frame.columns else None
+    sel = CL.select(objs, {**(ctx or {}), "bars": bars}, max_lines=n_max)
+    objs = sel["shown"]
+    if ylim is None:
+        ylim = DR.y_range(frame["low"].min(), frame["high"].max(), objs)
+        ax.set_ylim(*ylim)
+    xm = DR.XMap(starts, j0, n=len(frame))
+    DR.draw_mpl(ax, DR.geometry(objs, xm, ylim=ylim, min_degree=min_degree, max_lines=n_max, hidden_n=len(sel["hidden"])))
+    ax.set_xlim(-1, len(frame))
+    return objs
+
+
+def _story_box(fig, story):
+    """The per-timeframe reader story (draw_objects.tf_story lines) under the chart — display only."""
+    import textwrap
+    raw = story.splitlines() if isinstance(story, str) else list(story)
+    lines = "\n".join("\n".join(textwrap.wrap(x, 170, subsequent_indent="     ")) for x in raw)
+    fig.text(0.01, -0.01, lines, ha="left", va="top", fontsize=8, family="DejaVu Sans Mono", color="#212529")
+
+
+def _h1_method(ax, lv, t, trend, frame, j0, shown, act, debug):
+    """Layer 6b drawing of the 1H chart: the decision's areas (state, armed) and the trend-side line with its touches / touch N."""
+    for x, style in method_band_view(lv, t, shown, act, debug):
+        col = "#2f9e44" if x["role"] == LV.SUP else "#e03131"
+        if style == "broken":
+            ax.axhspan(x["lo"], x["hi"], facecolor="none", edgecolor="#868e96", ls="--", lw=1.0)
+        else:
+            ax.axhspan(x["lo"], x["hi"], color=col, alpha=0.30 if style == "armed" else 0.10, lw=0)
+        lab = area_label(x, style == "armed")
+        if debug:
+            lab += f" [births {'+'.join(x['births'])}]"
+        ax.text(len(frame) - 0.5, (x["lo"] + x["hi"]) / 2, " " + lab, fontsize=7, color="#868e96" if style == "broken" else col,
+                va="center")
+    ln, rt = _trend_line(lv, t, trend)
+    if ln is None:
+        return
+    (b1, y1), sl = ln["p1"], ln["slope"]
+    xs = [b for b in (b1, t)]
+    jx = [int(lv.h1_of[b]) - j0 for b in xs]
+    ys = [y1 + sl * (b - b1) for b in xs]
+    if jx[0] < 0:                                                          # starts before the window: clip at the first bar shown
+        b0 = next((b for b in range(b1, t + 1) if int(lv.h1_of[b]) >= j0), t)
+        jx[0], ys[0] = 0, y1 + sl * (b0 - b1)
+    ax.plot(jx, ys, color="#7048e8", lw=1.1, ls="-.")
+    for g in ln.get("touch_groups") or [[ln["p1"][0]], [ln["p2"][0]]]:     # touches by reactions (Abhi L4-g)
+        j = int(lv.h1_of[g[0]]) - j0
+        if 0 <= j < len(frame):
+            ax.plot(j, y1 + sl * (g[0] - b1), marker="o", ms=5, mfc="none", mec="#7048e8")
+    lab = f" line ({ln['touches']} touches)"
+    if rt is not None:
+        lab += f"; reaction turn = touch {rt['touch_no']}" + (" (trade location)" if rt["trade_location"] else "")
+    ax.text(len(frame) - 0.5, ys[-1], lab, color="#7048e8", fontsize=7, va="top")
+
+
+def story(r):
+    """Layer 6b (method §5): the story in the method's order (Telegram review caption, 3–6 lines) — the trend; the area and its state;
+    how price arrived (the visit, the approach leg); what happened inside (handover); the commitment and its volume comparison; the
+    LTF change; the RSI view. No scores, no ④ counts."""
+    from .setup_chart import rsi_words
+    tr = {"UP": "Daily ↑: खरेदीदार नियंत्रणात", "DOWN": "Daily ↓: विक्रेते नियंत्रणात", "RANGE": "Daily range: कडांवरच",
+          "NEUTRAL": "Daily neutral: trade नाही", "UNKNOWN": "Daily data अपुरा"}[r["daily_trend"]]
+    lines = [tr + (f" (protected {r['protected']['price']:,.0f})" if r.get("protected") else "")]
+    lv = r.get("level")
+    if not lv:
+        lines.append(r.get("why") or "trade-बाजूचा area नाही")
+        return "\n".join(lines)
+    st = str(lv.get("state") or "ACTIVE").lower()
+    lines.append(f"1H area: {lv['role']} {lv['lo']:,.0f}–{lv['hi']:,.0f} ({st}" + (f"; {lv['confluence_label']}" if lv.get("confluence_label")
+                                                                                  else "") + ")")
+    cm = r.get("commit") or {}
+    if cm.get("visit_start"):
+        hs = cm.get("handover_state") or {}
+        lines.append(f"visit {str(cm['visit_start'])[:16]} पासून (approach leg {str(cm.get('approach_from') or '-')[:16]} पासून); handover "
+                     + ("✔" + (f" ({hs['form']})" if hs.get("form") else "") if cm.get("handover_present") else "✘")
+                     + (" · absorption" if cm.get("absorption") else ""))
+    if cm.get("form"):
+        vol = ("volume NA (data problem)" if cm.get("vol_na") else f"volume > {cm['vol_vs']}" if cm.get("vol_vs") else "volume: —")
+        lines.append(f"commitment: {cm['form']} · {vol}")
+    ch = cm.get("choch") or {}
+    if ch.get("line"):
+        lines.append(ch["line"])
+    lines.append(rsi_words(r))
+    return "\n".join(lines[:6])
+
+
+def m15_png(V, t, title, bars=60, r=None, debug=False, vol=None, symbol=None, chart_objects="off", objects=None, story=None):
+    """15M (C1 default): level band, highlighted trigger candle, entry / SL / target and the setup mark - nothing else. debug=True
+    adds the B2 trigger, trapped zones, sweeps and the K line (old dense view). Volume pane below (vol = array aligned with V.m15,
+    else V.m15["volume"], else "volume: NA (grade cap B)").
+    chart_objects "on" (PA standard §4, display setting, default "off" = today's chart byte for byte): the ONE object list
+    (decision3.draw_objects — `objects`, else collected at t with the decision row r) replaces the level band; entry / SL / target and
+    the setup mark stay. story = per-timeframe reader story lines under the chart."""
+    if chart_objects not in ("off", "on"):
+        raise ValueError(f"m15_png: chart_objects {chart_objects!r} — off / on")
+    i0 = max(0, t - bars + 1)
+    m = V.m15.iloc[i0:t + 1].reset_index(drop=True)
+    fig, ax, axv = _vol_axes((13, 7.0))
+    _candles(ax, m)
+    if chart_objects == "on":
+        from . import draw_objects as DO
+        objs = DO.clean(objects)[0] if objects is not None else DO.collect(V, t, r=r, since=i0)
+        from . import chart_lines as CL
+        _objects_panel(ax, V.m15["timestamp"].iloc[:t + 1], i0, m, objs, ctx=CL.ctx_of_row(r))
+    elif r and r.get("level"):
+        lv = r["level"]
+        ax.axhspan(lv["lo"], lv["hi"], color="#2f9e44" if lv["role"] == LV.SUP else "#e03131", alpha=0.18)
+    if r and r.get("risk"):
+        rk = r["risk"]
+        for y, col, lab in ((rk["entry"], "#1c7ed6", "entry"), (rk["sl"], "#e03131", "SL"), (rk["target"], "#2f9e44", "target")):
+            if y is not None:
+                ax.axhline(y, color=col, lw=0.9, ls="--")
+                ax.text(len(m) - 0.5, y, f" {lab} {y:,.0f}", color=col, fontsize=8, va="bottom")
+    ax.axvspan(len(m) - 1.5, len(m) - 0.5, color="#fab005", alpha=0.18, lw=0)   # C1: trigger candle (निर्णयाचा bar)
+    bp = M.plans_of(V, r) if (debug and r and r.get("risk")) else None
+    if bp:                                                                     # B2 योजना: signal-bar extreme पलीकडचा trigger
+        y = bp["B2"]["trigger"]
+        ax.axhline(y, color="#868e96", lw=0.8, ls=":")
+        ax.text(len(m) - 0.5, y, f" B2 trigger {y:,.0f} (R:R {bp['B2']['rr']})", color="#868e96", fontsize=7, va="top")
+    lq = (r.get("liquidity") or {}) if (r and debug) else {}
+    for x in lq.get("trapped") or ():                                          # §7.6 trapped zone पट्टा
+        ax.axhspan(x["lo"], x["hi"], color="#fd7e14", alpha=0.12, hatch="///", lw=0)
+        ax.text(0, x["hi"], f" trapped {'buyers' if x['side'] == 'buy' else 'sellers'} {x['lo']:,.0f}-{x['hi']:,.0f}",
+                color="#d9480f", fontsize=7, va="bottom")
+    for x in lq.get("sweeps") or ():                                           # §7.6 sweep खूण (pool पलीकडे जाऊन परत)
+        b = int(x.get("bar", -1))
+        if i0 <= b <= t:
+            ax.plot(b - i0, x["extreme"], marker="X", color="#d9480f", ms=7)
+            ax.text(b - i0, x["extreme"], f" SWEEP {x['src']} {x['price']:,.0f}", color="#d9480f", fontsize=7,
+                    va="bottom" if x["side"] == "buy" else "top")
+    tl = r.get("trendline") if (r and debug) else None
+    if tl:                                                                     # ⑤ K ची आतली रेघ (t पर्यंत) + break खूण
+        (b1, y1), sl = tl["p1"], tl["slope"]
+        xs = [max(b1, i0), t]
+        ax.plot([x - i0 for x in xs], [y1 + sl * (x - b1) for x in xs], color="#7048e8", lw=1.1, ls="-.")
+        lab = f" K line ({tl['touches']} touches)" + (" broken" if tl["broken"] else " gone" if tl.get("broken_before") is not None else "")
+        ax.text(len(m) - 0.5, y1 + sl * (t - b1), lab, color="#7048e8", fontsize=8, va="top")
+        if tl["broken"] and tl["break_bar"] is not None and tl["break_bar"] >= i0:
+            bb = tl["break_bar"]
+            ax.plot(bb - i0, float(V.m15["close"].iloc[bb]), marker="x", color="#7048e8", ms=8)
+    if r and r.get("mark"):
+        up = bool(r.get("level")) and r["level"]["role"] == LV.SUP                 # chart वर emoji नाही (font) ⇒ English label + बाण
+        lab = {"✅": "SETUP A", "🟡": "SETUP B"}.get(r["mark"], str(r["mark"]))
+        ax.annotate(("▲ " if up else "▼ ") + lab, (len(m) - 1, float(m["close"].iloc[-1])), textcoords="offset points",
+                    xytext=(0, -26 if up else 18), ha="center", fontsize=11, color="#2f9e44" if r["mark"] == "✅" else "#e8590c")
+    ax.set_title(f"{title} · 15M · {r['decision'] if r else ''} {r.get('conviction') or '' if r else ''}", fontsize=10)
+    vv = (np.asarray(vol, dtype=float)[i0:t + 1] if vol is not None else _col(m, "volume", symbol or title))
+    lv = (r or {}).get("level") or {}
+    VP.draw_mpl(axv, VP.study(m, vol=vv, info=r, commit=len(m) - 1, symbol=symbol or title,
+                              area=(lv["lo"], lv["hi"]) if lv.get("lo") is not None else None, d=lv.get("role"),
+                              words="method"))                            # layer 6b: review chart = the method's words
+    _xticks(axv, m["timestamp"].to_numpy(), max(1, len(m) // 12))
+    if story:
+        _story_box(fig, story)
+    return _png(fig)
+
+
+BAND_COLOR = {"UP": "#8ce99a", "DOWN": "#ffa8a8", "RANGE": "#ffe066", "NEUTRAL": "#ced4da", "UNKNOWN": "#f8f9fa"}
+
+
+STATE_COLOR = {"UP · impulse": "#69db7c", "UP · correction": "#b2f2bb", "DOWN · impulse": "#ff8787", "DOWN · correction": "#ffc9c9",
+               "RANGE": "#ffe066", "NEUTRAL": "#ced4da", "UNKNOWN": "#f8f9fa", "UP": "#8ce99a", "DOWN": "#ffa8a8"}
+BAND_STATE_COLOR = {"fresh": "#1971c2", "tested": "#e67700", "broken": "#868e96", "target": "#5f3dc4"}
+
+# §5.4–5.6 (Abhi): default Daily chart वरची प्रत्येक रेषा / पट्टा legend मध्ये — style (gid) ⇒ legend मजकूर, रंग
+STYLE_COLOR = {"impulse leg": "#e8590c", "trend leg": "#e8590c", "correction (done)": "#1c7ed6", "counter-move (in progress)": "#1c7ed6",
+               "older correction": "#1c7ed6", "protected origin": "#7048e8", "sharp band": "#f08c00", "demand": "#2f9e44",
+               "supply": "#e03131", "broken": "#868e96", "target": "#0c8599", "pullback": "#495057"}
+# CD14 (Abhi): घन = impulse (read_counter 5 waves किंवा Abhi ने स्वीकारलेलं वाचन — एकच दिसणं ⇒ एकच legend ओळ "impulse");
+# dashed = "trend leg" (impulse दावा नाही) — default / Telegram वर "not verified" शब्द कुठेच नाही (तो तपशील debug / JSON मध्ये)
+LEGEND_TEXT = {"impulse leg": "impulse", "trend leg": "trend leg", "correction (done)": "correction (done)",
+               "counter-move (in progress)": "counter-move in progress", "older correction": "older correction (no label)",
+               "protected origin": "protected origin", "sharp band": "sharp-fall / sharp-rise band", "demand": "demand",
+               "supply": "supply", "broken": "broken level (dashed)", "target": "structural target"}
+LEGEND_ORDER = tuple(LEGEND_TEXT)
+LEG_KW = {"impulse leg": dict(lw=3, alpha=0.55), "trend leg": dict(lw=1.8, alpha=0.6, ls="--")}   # chart रेषा = legend handle
+
+
+def _legend_handles(styles):
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+    C = STYLE_COLOR
+    mk = {"impulse leg": lambda: Line2D([], [], color=C["impulse leg"], **LEG_KW["impulse leg"]),
+          "trend leg": lambda: Line2D([], [], color=C["trend leg"], **LEG_KW["trend leg"]),
+          "correction (done)": lambda: Patch(fc=C["correction (done)"], ec=C["correction (done)"], alpha=0.25),
+          "counter-move (in progress)": lambda: Patch(fc="none", ec=C["counter-move (in progress)"], ls="--"),
+          "older correction": lambda: Patch(fc=C["older correction"], ec=C["older correction"], alpha=0.08),
+          "protected origin": lambda: Line2D([], [], color=C["protected origin"], lw=1.6),
+          "sharp band": lambda: Patch(color=C["sharp band"], alpha=0.30),
+          "demand": lambda: Patch(color=C["demand"], alpha=0.30),
+          "supply": lambda: Patch(color=C["supply"], alpha=0.25),
+          "broken": lambda: Line2D([], [], color=C["broken"], lw=1.1, ls="--"),
+          "target": lambda: Line2D([], [], color=C["target"], lw=1.3, ls=":")}
+    return [mk[k]() for k in LEGEND_ORDER if k in styles], [LEGEND_TEXT[k] for k in LEGEND_ORDER if k in styles]
+
+
+class _Layout:
+    """§5.5 (Abhi): मजकूर candles वर / दुसऱ्या मजकुरावर नाही — display (pixel) bboxes; जागा नाही ⇒ label सोडतो."""
+
+    def __init__(self, fig, ax, fr):
+        self.fig, self.ax = fig, ax
+        self.lo, self.hi = fr["low"].to_numpy(float), fr["high"].to_numpy(float)
+        self.boxes = []
+        self.r = fig.canvas.get_renderer()
+
+    def candles_hit(self, bb):
+        (x0, y0), (x1, y1) = self.ax.transData.inverted().transform([[bb.x0, bb.y0], [bb.x1, bb.y1]])
+        a, b = max(0, int(np.ceil(x0 - 0.3))), min(len(self.lo) - 1, int(np.floor(x1 + 0.3)))
+        return a <= b and bool(((self.lo[a:b + 1] <= y1) & (self.hi[a:b + 1] >= y0)).any())
+
+    def free(self, bb, inside=True, pad=4.0):
+        ab = self.ax.get_window_extent(self.r)
+        if inside and not (bb.x0 >= ab.x0 and bb.x1 <= ab.x1 and bb.y0 >= ab.y0 and bb.y1 <= ab.y1):
+            return False
+        if not inside and not (bb.y0 >= ab.y0 and bb.y1 <= ab.y1):
+            return False
+        g = bb.expanded(1.0, 1.0).padded(pad)
+        if any(g.overlaps(o) for o in self.boxes):
+            return False
+        return not (inside and self.candles_hit(bb))
+
+    def take(self, t, inside=True):
+        bb = t.get_window_extent(self.r)
+        if self.free(bb, inside):
+            self.boxes.append(bb)
+            return True
+        return False
+
+
+def daily_swings_fig(v, title, full=False):
+    """C1 / §5 (Abhi) default Daily chart — trend-degree structure only, decluttered: impulse legs (one line each); correction boxes
+    (depth = start extreme to end extreme) with text only on the current and the previous same-degree correction ("pullback" once in
+    the in-progress box; older boxes faint without text, omitted on windows longer than `chart_old_box_sessions`); at most 6 level
+    bands ranked by degree with trader names in the right margin (one broken band at most, dashed); a legend for every style drawn;
+    no text over candles or other text (a label without room is dropped together with its band). full=True: every box labelled,
+    every pullback mark and every band (debug). Bottom strip: degree-aware and Dow-minor states. Visual review only.
+    रिटर्न (fig, info) — info: ax, bx, frame, labels [{kind, text, artist}], styles (drawn), dropped."""
+    import matplotlib.transforms as mtransforms
+    from matplotlib.patches import Rectangle
+
+    from . import daily_swings as DS
+    sp = DS.view_spec(v, full=full)
+    d, i0 = v["frame"], v["i0"]
+    fr = d.iloc[i0:].reset_index(drop=True)
+    nn = len(fr)
+    x = lambda b: b - i0                                                   # noqa: E731
+    fig, (ax, bx) = plt.subplots(2, 1, figsize=(20, 9.5), gridspec_kw={"height_ratios": [7, 1]}, sharex=True)
+    fig.subplots_adjust(left=0.06, right=0.84, top=0.94, bottom=0.08, hspace=0.05)
+    _candles(ax, fr)
+    lo_, hi_ = float(fr["low"].min()), float(fr["high"].max())
+    rng = (hi_ - lo_) or 1.0
+    ylo, yhi = lo_ - 0.06 * rng, hi_ + 0.06 * rng
+    C = STYLE_COLOR
+    styles, labels, dropped = set(), [], []
+    npts = int(S3.load(v.get("s"))["chart_leg_path_points"])
+    for lg in sp["impulses"]:                                              # trend-degree legs: खऱ्या pivots मधून zig-zag (Abhi review); CD14:
+        st = leg_gid(lg)                                                   # verified किंवा Abhi-accepted ⇒ घन impulse, बाकी dashed trend leg
+        xs, ys = _clip_path(leg_window_path(lg, i0, npts), i0)
+        if len(xs) < 2:
+            continue
+        ax.plot(xs, ys, color=C[st], solid_capstyle="round", gid=st, **LEG_KW[st])
+        styles.add(st)
+    for c in sp["boxes"]:                                                  # corrections = boxes (start extreme ⇒ end extreme)
+        st = "older correction" if c["faint"] else ("correction (done)" if c["state"] == "done" else "counter-move (in progress)")
+        a, b = max(c["start_bar"], i0), c["end_bar"] if c["state"] == "done" else v["n"] - 1
+        y0, y1 = sorted((c["start_price"], c["end_price"]))
+        ax.add_patch(Rectangle((x(a) - 0.5, y0), b - a + 1, y1 - y0, fill=True, fc=C[st], ec=C[st],
+                               alpha=0.04 if c["faint"] else 0.08, lw=0.6 if c["faint"] else 1.0,
+                               ls="--" if c["state"] != "done" else "-", gid=st))
+        styles.add(st)
+    bands = [dict(b, style=DS.band_style(b)) for b in sp["bands"]]
+    styles |= {b["style"] for b in bands if ylo <= b["price"] <= yhi}
+    if any(b["role"] == "protected" for b in bands):
+        styles.add("protected origin")
+    ax.set_ylim(ylo, yhi)
+    ax.set_title(f"{title} · Daily structure (trend degree) · " + DS.trend_line(v["q15"], debug=full) + " · visual review only",
+                 fontsize=10)
+    lay = _Layout(fig, ax, fr)
+    fig.canvas.draw()
+
+    def legend(st):
+        h, t = _legend_handles(st)
+        return ax.legend(handles=h, labels=t, fontsize=7, framealpha=0.92, ncol=1, borderaxespad=0.4)
+
+    best = None                                                            # §5.6: legend त्या कोपऱ्यात जिथे y-axis कमी वाढवावा लागतो
+    for loc in ("upper left", "lower left", "upper right", "lower right"):
+        lgd = legend(styles)
+        lgd.set_loc(loc)
+        bb = lgd.get_window_extent(lay.r)
+        (fx0, fy0), (fx1, fy1) = ax.transAxes.inverted().transform([[bb.x0, bb.y0], [bb.x1, bb.y1]])
+        lgd.remove()
+        xa, xb = ax.transData.inverted().transform([[bb.x0, 0], [bb.x1, 0]])[:, 0]
+        ia, ib = max(0, int(np.ceil(xa - 0.3))), min(nn - 1, int(np.floor(xb + 0.3)))
+        if ia > ib:
+            ext, lim = 0.0, (ylo, yhi)
+        elif loc.startswith("upper"):
+            f0 = max(fy0 - 0.015, 0.2)
+            top = ylo + (float(fr["high"].iloc[ia:ib + 1].max()) - ylo) / f0
+            ext, lim = max(0.0, top - yhi), (ylo, max(yhi, top))
+        else:
+            f1 = min(fy1 + 0.015, 0.8)
+            bot = (float(fr["low"].iloc[ia:ib + 1].min()) - yhi * f1) / (1 - f1)
+            ext, lim = max(0.0, ylo - bot), (min(ylo, bot), yhi)
+        if best is None or ext < best[0] - 1e-9:
+            best = (ext, loc, lim)
+    ylo, yhi = best[2]
+    ax.set_ylim(ylo, yhi)
+    fig.canvas.draw()
+
+    # §5.4 / §5.5: पट्टे — label उजव्या margin मध्ये. आधी "ठेवायचेच" (protected / sharp / parent = rank ≤ 1, target, title मधली next
+    # demand / supply, caption मधले जवळचे दोन) — जागा मिळेपर्यंत वर / खाली सरकवतो (लहान leader रेषा); बाकी rank क्रमाने, जागा नाही ⇒
+    # label आणि पट्टा दोन्ही नाहीत (नाव `dropped` मध्ये ⇒ JSON / Vision facts)
+    tr = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+    step = (yhi - ylo) * 11.0 / max(ax.get_window_extent(lay.r).height, 1.0)
+    near = {b["name"] for b in DS.nearest_bands(v) if b is not None}
+    keep = lambda b: b["rank"] <= 1 or b["role"] == "target" or "target" in b.get("also", ()) or \
+        b["label"].startswith("next ") or b["name"] in near                # noqa: E731
+    shown = []
+    for bd in sorted(bands, key=lambda b: not keep(b)):                    # sort stable ⇒ rank क्रम टिकतो
+        col = C[bd["style"]]
+        inside = ylo <= bd["price"] <= yhi
+        y = bd["price"] if inside else (yhi if bd["price"] > yhi else ylo)
+        txt = (" " if inside else (" ▲ " if bd["price"] > yhi else " ▼ ")) + bd["name"]
+        t = ax.text(1.003, y, txt, transform=tr, fontsize=7.5, color=col, va="center", ha="left", clip_on=False,
+                    gid=bd["style"] if inside else None)                   # कडेचा बाण (पट्टा काढलेला नाही) ⇒ legend मध्ये नाही
+        ok = None
+        span = 60 if keep(bd) else 2
+        for k in [0] + [j * sg for j in range(1, span + 1) for sg in (1, -1)]:
+            t.set_y(y + k * step)
+            if lay.take(t, inside=False):
+                ok = k
+                break
+        if ok is None:
+            t.remove()
+            dropped.append(bd["name"])
+            continue
+        if ok:                                                             # सरकवलेला label ⇒ पट्ट्याकडे लहान रेषा
+            ax.plot([1.0, 1.003], [y, y + ok * step], transform=tr, color=col, lw=0.6, clip_on=False)
+        shown.append(bd)
+        labels.append({"kind": "band", "text": t.get_text(), "artist": t, "name": bd["name"]})
+        if not inside:
+            continue
+        if bd["style"] == "broken":
+            ax.plot([-0.5, nn - 0.5], [bd["price"]] * 2, color=col, lw=1.1, ls="--", gid="broken")
+        elif bd["style"] == "target":
+            ax.plot([-0.5, nn - 0.5], [bd["price"]] * 2, color=col, lw=1.3, ls=":", gid="target")
+        else:
+            ax.axhspan(bd["lo"], bd["hi"], color=col, alpha=0.10 if bd["style"] == "protected origin" else 0.15, lw=0, gid=bd["style"])
+    pq = sp["protected"]
+    if pq and ylo <= pq["price"] <= yhi and any(b["role"] == "protected" for b in shown):   # origin रेषा (label = पट्ट्याचा)
+        a = max(pq["bar"], i0)
+        ax.plot([x(a), nn - 0.5], [pq["price"]] * 2, color=C["protected origin"], lw=1.6, gid="protected origin")
+        styles.add("protected origin")
+    shown_in = {b["style"] for b in shown if ylo <= b["price"] <= yhi}
+    styles = (styles - {b["style"] for b in bands}) | shown_in            # टाकलेले / कडेचे पट्टे legend मध्ये नाहीत
+    if pq and any(b["role"] == "protected" for b in shown) and ylo <= pq["price"] <= yhi:
+        styles.add("protected origin")
+    lgd = legend(styles)
+    lgd.set_loc(best[1])
+    fig.canvas.draw()
+    lay.boxes.append(lgd.get_window_extent(lay.r))
+    lay.boxes.append(ax.title.get_window_extent(lay.r))
+
+    wa_bars = {wv["bar"] for wv in sp.get("waves") or ()}                  # Q49: 5-wave पहिला पाय = "A" (पर्याय "1" फक्त debug)
+    marked = set()
+    for c in sp["boxes"]:                                                  # Abhi review: family वाचलेल्या pivots वर a / b / c (W X Y, a–e)
+        if not c["label"]:
+            continue
+        marks = c.get("marks") or ()
+        upper = False
+        if c["state"] != "done" and any(c["start_bar"] <= b <= c["end_bar"] for b in wa_bars):
+            # Q49: चालू counter-move चा पहिला पाय = wave A. Box चं "a" त्याच pivot वर ⇒ तीच count, मोठ्या अक्षरांत (A B C);
+            # नाहीतर box चं तात्पुरतं family वाचन (उदा. triangle, A = "c") Q49 शी विसंगत ⇒ त्याची अक्षरं नाहीत, फक्त "A" (खाली)
+            upper = any(mk["letter"] == "a" and mk["bar"] in wa_bars for mk in marks)
+            if not upper:
+                marks = ()
+        for mk in marks:
+            if mk["bar"] < i0:
+                continue
+            up = mk["kind"] == "H"
+            sg = 1 if up else -1
+            txt, kind = (mk["letter"].upper(), "wave_a") if upper else (mk["letter"], "wave")
+            tries = [(x(mk["bar"]), mk["price"], "center", "bottom" if up else "top", (dx, sg * dy))
+                     for dy, dx in ((3, 0), (3, 7), (3, -7), (12, 0))]
+            t = _place(ax, lay, txt, tries, 9 if kind == "wave_a" else 8, "#1864ab", weight="bold")
+            marked.add(mk["bar"])
+            if t is None:
+                dropped.append(txt)
+            else:
+                labels.append({"kind": kind, "text": txt, "artist": t, "bar": mk["bar"], "price": mk["price"]})
+    for wv in sp.get("waves") or ():
+        if wv["bar"] in marked:                                            # त्या pivot वर family अक्षर आधीच (a ⇒ A वर) ⇒ दुसरं नाही
+            continue
+        up = wv["kind"] == "H"
+        sg = 1 if up else -1
+        tries = [(x(wv["bar"]), wv["price"], "center", "bottom" if up else "top", (dx, sg * dy))
+                 for dy, dx in ((3, 0), (3, 7), (3, -7), (12, 0))]
+        t = _place(ax, lay, wv["label"], tries, 9, "#1864ab", weight="bold")
+        if t is None:
+            dropped.append(wv["label"])
+        else:
+            labels.append({"kind": "wave_a", "text": wv["label"], "artist": t, "bar": wv["bar"], "price": wv["price"]})
+    # §5.1 / §5.2 / §5.5: box labels (चालू + आधीची) — box वर / आत, collision नाही ⇒ label नाही
+    fs = 7.5 if nn <= 200 else 7
+    for c in sp["boxes"]:
+        if not c["label"]:
+            continue
+        a, b = max(c["start_bar"], i0), c["end_bar"] if c["state"] == "done" else v["n"] - 1
+        xa, xb = x(a) - 0.5, x(b) + 0.5
+        y0, y1 = sorted((c["start_price"], c["end_price"]))
+        above = [(xa, y1, "left", "bottom", (0, 3)), (xb, y1, "right", "bottom", (0, 3))]
+        below = [(xa, y0, "left", "top", (0, -3)), (xb, y0, "right", "top", (0, -3))]
+        inner = [(xa, y1, "left", "top", (3, -3)), (xb, y1, "right", "top", (-3, -3)), (xa, y0, "left", "bottom", (3, 3)),
+                 (xb, y0, "right", "bottom", (-3, 3))]
+        far = [(px, py, ha, va, (dx, dy + (12 * k if dy > 0 else -12 * k))) for k in (1, 2, 3)
+               for px, py, ha, va, (dx, dy) in above + below]
+        tries = (inner + above + below if c["state"] != "done" else above + below + inner) + far
+        t = _place(ax, lay, c["label"], tries, fs, C["counter-move (in progress)"] if c["state"] != "done" else "#1864ab")
+        if t is None:
+            dropped.append(c["label"])
+        else:
+            labels.append({"kind": "correction", "text": c["label"], "artist": t})
+    for pb in sp["pullbacks"]:                                             # §5.2: एकच "pullback" खूण (full ⇒ सगळ्या)
+        up = pb["kind"] == "H"
+        px, py = x(pb["bar"]), pb["price"]
+        tries = [(px, py, ha, "bottom" if up else "top", (dx, (6 + 10 * k) * (1 if up else -1))) for k in range(10)
+                 for ha, dx in (("center", 0), ("right", -4), ("left", 4))]   # leader रेषा ⇒ लांब offset चालतो
+        txt = pb.get("text") or "pullback"
+        t = _place(ax, lay, txt, tries, 7, C["pullback"])                 # मजकूरच स्वतःचं स्पष्टीकरण ⇒ legend नाही
+        if t is None:
+            dropped.append(txt)
+        else:
+            labels.append({"kind": "correction", "text": txt, "artist": t, "bar": pb["bar"], "price": pb["price"]})
+            bb = t.get_window_extent(lay.r)                                # label सरकलेला ⇒ टोकापासून label पर्यंत लहान leader रेषा
+            ex, ey = ax.transData.inverted().transform([(bb.x0 + bb.x1) / 2, bb.y0 if up else bb.y1])
+            ax.plot([px, ex], [py, ey], color=C["pullback"], lw=0.6, alpha=0.8)
+    for lg in sp["impulses"]:                                              # चालू leg: "impulse (5 waves)" / "impulse" / "decline in progress"
+        if lg.get("state") != "in progress":
+            continue
+        word = "decline" if lg["dir"] < 0 else "advance"
+        if full:                                                           # debug: पूर्ण तपासणी (CD14)
+            txt = f"{word} in progress — " + DS.leg_check_text(lg)
+        elif lg.get("verified"):
+            txt = "impulse (5 waves)"
+        else:                                                              # CD14: "not verified" मजकूर default मध्ये नाही
+            txt = "impulse" if lg.get("accepted") else f"{word} in progress"
+        pts = [p for p in leg_window_path(lg, i0, npts) if p[0] >= i0]
+        dn = lg["dir"] < 0
+        tries = []
+        for b_, y_ in reversed(pts):
+            for dy in (6, 16, 28):
+                tries += [(x(b_), y_, ha, "top" if dn else "bottom", (0, -dy if dn else dy)) for ha in ("right", "center", "left")]
+        t = _place(ax, lay, txt, tries, 7.5, C[leg_gid(lg)])
+        if t is None:
+            dropped.append(txt)
+        else:
+            labels.append({"kind": "leg", "text": txt, "artist": t})
+    for row, (name, runs_) in enumerate((("degree-aware", sp["strip"]["degree-aware"]), ("Dow minor", sp["strip"]["Dow minor"]))):
+        for a, b, st in runs_:
+            if b < i0:
+                continue
+            a2 = max(a, i0)
+            bx.add_patch(plt.Rectangle((x(a2) - 0.5, row), b - a2 + 1, 0.9, color=STATE_COLOR.get(st, "#fff"), lw=0))
+            if b - a2 >= max(8, nn // 14):                                 # लहान runs वर नाव नाही (गर्दी)
+                bx.text(x(a2) + (b - a2) / 2, row + 0.45, st.replace("· impulse", "· trend leg"), ha="center", va="center",
+                        fontsize=7)                                         # CD11: engine phase "impulse" = Dow trend leg
+        bx.text(-1, row + 0.45, name, ha="right", va="center", fontsize=8)
+    bx.set_ylim(0, 2)
+    bx.set_yticks([])
+    ax.grid(alpha=0.12)
+    _xticks(bx, fr["timestamp"].to_numpy(), max(1, len(fr) // 24))
+    return fig, {"ax": ax, "bx": bx, "frame": fr, "labels": labels, "styles": styles, "dropped": dropped, "spec": sp}
+
+
+def leg_gid(lg):
+    """CD14: chart style (gid) — `daily_swings.drawn_as` "impulse" ⇒ "impulse leg" (घन), "trend leg" ⇒ "trend leg" (dashed)."""
+    from . import daily_swings as DS
+    return "impulse leg" if DS.drawn_as(lg) == "impulse" else "trend leg"
+
+
+def leg_window_path(lg, i0, max_points=15):
+    """Window मधला leg चा भाग: leg चे स्वतःचे pivots (window आधीचा एक बिंदू कापण्यासाठी) ⇒ कमाल max_points (मोठे swings च)."""
+    from . import daily_swings as DS
+    pts = [tuple(p) for p in (lg.get("pivots") or lg.get("path") or [[lg["from"], lg["p0"]], [lg["to"], lg["p1"]]])]
+    k = next((j for j, (b, _) in enumerate(pts) if b >= i0), len(pts) - 1)
+    return [list(p) for p in DS.coarse_path(pts[max(k - 1, 0):], max_points)]
+
+
+def _clip_path(path, i0):
+    """[[bar, price], …] ⇒ window (i0 पासून) मधले x / y; i0 ओलांडणारा भाग i0 ला कापतो."""
+    xs, ys = [], []
+    for k, (b, p) in enumerate(path):
+        if b >= i0:
+            if not xs and k > 0 and path[k - 1][0] < i0:
+                (b0, p0) = path[k - 1]
+                xs.append(0)
+                ys.append(p0 + (p - p0) * (i0 - b0) / max(b - b0, 1))
+            xs.append(b - i0)
+            ys.append(p)
+    return xs, ys
+
+
+def _place(ax, lay, text, tries, fs, color, weight="normal"):
+    """पहिली मोकळी जागा (candles / मजकूर / legend वर नाही, axes आत) ⇒ text artist; कुठेच नाही ⇒ None (label सोडतो)."""
+    for px, py, ha, va, off in tries:
+        t = ax.annotate(text, (px, py), textcoords="offset points", xytext=off, ha=ha, va=va, fontsize=fs, color=color,
+                        annotation_clip=False, fontweight=weight)
+        if lay.take(t):
+            return t
+        t.remove()
+    return None
+
+
+def daily_swings_render(v, title, full=False):
+    """daily_swings_fig ⇒ (PNG, meta) — meta = chart वर प्रत्यक्ष काय आलं (JSON `chart` / Vision facts): bands_drawn, dropped, labels."""
+    fig, info = daily_swings_fig(v, title, full=full)
+    meta = {"bands_drawn": [x["name"] for x in info["labels"] if x["kind"] == "band"], "dropped": list(info["dropped"]),
+            "labels": [x["text"].strip() for x in info["labels"]]}
+    return _png(fig), meta
+
+
+def daily_swings_png(v, title, full=False):
+    """daily_swings_fig ⇒ PNG (Telegram default; full=True ⇒ सगळं, debug)."""
+    return daily_swings_render(v, title, full=full)[0]
+
+
+def daily_swings_debug_png(v, title):
+    """Debug (C1): the old dense view - Dow minor pivots with HH/HL/LH/LL and protected swings, Q15 legs / origin / phases, Elliott
+    advisory labels (gray = "?"). Not sent to Telegram unless asked. Visual review only."""
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    from . import daily_swings as DS
+    d, i0 = v["frame"], v["i0"]
+    fr = d.iloc[i0:].reset_index(drop=True)
+    x = lambda b: b - i0                                                   # noqa: E731
+    fig, (ax, bx) = plt.subplots(2, 1, figsize=(20, 9.5), gridspec_kw={"height_ratios": [7, 1]}, sharex=True)
+    _candles(ax, fr)
+    for lg in v["legs"]:                                                   # (b) legs
+        b = lg["to"]
+        if lg["class"] == "impulse":
+            ax.plot([x(lg["from"]), x(b)], [lg["p0"], lg["p1"]], color="#f76707", lw=3, alpha=0.35, solid_capstyle="round")
+        elif lg["class"] == "corrective":
+            ax.plot([x(lg["from"]), x(b)], [lg["p0"], lg["p1"]], color="#7048e8", lw=1.2, ls=":", alpha=0.8)
+    npts = int(S3.load(v.get("s"))["chart_leg_path_points"])
+    for lg in (v["q15"].get("objects") or {}).get("impulses") or ():       # CD14: trend-degree legs + पूर्ण तपासणी (फक्त debug मध्ये)
+        xs, ys = _clip_path(leg_window_path(lg, i0, npts), i0)
+        if len(xs) < 2:
+            continue
+        st = leg_gid(lg)
+        ax.plot(xs, ys, color=STYLE_COLOR[st], solid_capstyle="round", **{**LEG_KW[st], "alpha": 0.35})
+        dn = lg["dir"] < 0
+        ax.annotate(DS.leg_check_text(lg), (xs[-1], ys[-1]), textcoords="offset points", xytext=(0, -26 if dn else 26),
+                    ha="right" if xs[-1] > 0.6 * len(fr) else "left", va="top" if dn else "bottom", fontsize=7, color="#a23d00",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#e8590c", lw=0.5, alpha=0.9), annotation_clip=False)
+    for sg in v["minor"]["protected"]:                                     # (a) protected
+        if sg["to"] < i0:
+            continue
+        a = max(sg["bar"], i0)
+        ax.plot([x(a), x(sg["to"])], [sg["price"]] * 2, color="#1c7ed6", lw=1.1, ls="--")
+        if sg["ended"] == "broken":
+            ax.plot([x(sg["to"])], [sg["price"]], marker="x", color="#1c7ed6", ms=7, mew=2)
+    for sg in v["q15"]["protected"]:                                       # (b) impulse origin
+        if sg["to"] < i0:
+            continue
+        a = max(sg["bar"], i0)
+        ax.plot([x(a), x(sg["to"])], [sg["price"]] * 2, color="#e8590c", lw=1.6)
+        if sg["ended"] == "broken":
+            ax.plot([x(sg["to"])], [sg["price"]], marker="X", color="#e8590c", ms=8)
+    rng = float(fr["high"].max() - fr["low"].min()) or 1.0
+    for p in v["pivots"]:                                                  # (a) pivots + tags + elliott label
+        if not p["in_window"]:
+            continue
+        up = p["kind"] == "H"
+        ax.plot([x(p["bar"])], [p["price"]], marker="v" if up else "^", color="#1c7ed6" if up else "#e8590c", ms=6,
+                markeredgecolor="#212529" if (p["protected_minor"] or p["protected_q15"]) else None)
+        lab = p["tag"] + ("*" if p["protected_minor"] else "")
+        ax.annotate(lab, (x(p["bar"]), p["price"]), textcoords="offset points", xytext=(0, 8 if up else -12), ha="center", fontsize=6.5,
+                    color="#1c7ed6" if up else "#e8590c", fontweight="bold")
+        if p.get("wave_label"):
+            ax.text(x(p["bar"]), p["price"] + (0.055 if up else -0.055) * rng, p["wave_label"], ha="center", va="center", fontsize=9,
+                    color="#5f3dc4", fontweight="bold", bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="#5f3dc4", lw=0.6))
+    wa = v["q15"].get("wave_a")                                            # Q49 debug: "A (alt: 1)"
+    if wa and wa["bar"] >= i0:
+        up = wa["kind"] == "H"
+        ax.text(x(wa["bar"]), wa["price"] + (0.075 if up else -0.075) * rng, f"A (alt: {v['q15'].get('alt') or '-'})", ha="center",
+                va="center", fontsize=8, color="#c92a2a", fontweight="bold")
+    lo_, hi_ = float(fr["low"].min()), float(fr["high"].max())
+    ax.set_ylim(lo_ - 0.09 * rng, hi_ + 0.09 * rng)                        # labels / tags कापले जात नाहीत
+    for t in v["q15"]["targets"] or ():
+        ax.axhline(t, color="#868e96", lw=0.8, ls="--")
+        ax.text(len(fr) - 0.5, t, f" target {t:,.0f}", color="#868e96", fontsize=7, va="bottom")
+    for row, (key, name) in enumerate((("q15", "Q15 degree-aware"), ("minor", "Dow minor swings"))):
+        for a, b, s in v[key]["bands"]:
+            if b < i0:
+                continue
+            a2 = max(a, i0)
+            bx.add_patch(plt.Rectangle((x(a2) - 0.5, row), b - a2 + 1, 0.9, color=BAND_COLOR.get(s, "#fff"), lw=0))
+        bx.text(-1, row + 0.45, name, ha="right", va="center", fontsize=8)
+    for a, b, s in v["q15"]["phases"]:                                     # Q15 wave नावं पट्ट्यावर
+        if b < i0 or s.startswith("-"):
+            continue
+        a2 = max(a, i0)
+        if b - a2 >= 12:                                                   # लहान runs वर नाव नाही (गर्दी)
+            ph, wv = s.split("|")
+            bx.text(x(a2) + (b - a2) / 2, 0.45, ph.replace("_", " "), ha="center", va="center", fontsize=6.5)   # Q34: क्रमांक नाही
+    bx.set_ylim(0, 2)
+    bx.set_yticks([])
+    hdl = [Line2D([], [], color="#1c7ed6", ls="--", label="Dow minor: protected (x = broken by close)"),
+           Line2D([], [], marker="v", ls="", color="#1c7ed6", label="pivot H / L with HH-LH-HL-LL (* = was protected)"),
+           Line2D([], [], color="#e8590c", lw=1.6, label="Q15: impulse origin = protected (X = broken by close)"),
+           Line2D([], [], color="#f76707", lw=3, alpha=0.35, label="Q15 leg: impulse"),
+           Line2D([], [], color="#7048e8", lw=1.2, ls=":", label="Q15 leg: corrective"),
+           Line2D([], [], color=STYLE_COLOR["impulse leg"], **{**LEG_KW["impulse leg"], "alpha": 0.35},
+                  label="trend leg: impulse (5 waves, or accepted by Abhi)"),
+           Line2D([], [], color=STYLE_COLOR["trend leg"], **{**LEG_KW["trend leg"], "alpha": 0.35},
+                  label="trend leg: impulse not verified (votes in the leg's note)"),
+           Patch(fc="white", ec="#5f3dc4", label="Elliott advisory label ('?' = weak vote) — not used in decisions")]
+    hdl += [Patch(color=BAND_COLOR[k], label=f"state {k}") for k in ("UP", "DOWN", "NEUTRAL", "RANGE")]
+    ax.legend(handles=hdl, loc="upper left", fontsize=7, ncol=2, framealpha=0.9)
+    ax.set_title(f"{title} · Daily swings DEBUG — Dow minor vs degree-aware (Q15) · visual review only\n"
+                 + DS.trend_line(v["q15"], debug=True), fontsize=9)
+    ax.grid(alpha=0.15)
+    _xticks(bx, fr["timestamp"].to_numpy(), max(1, len(fr) // 24))
+    fig.tight_layout()
+    return _png(fig)

@@ -1,0 +1,830 @@
+"""vision/engine_audit.py — T-5 (Handover; owner-orders DECISIONS 31, PROVISIONAL): Vision audits an ENGINE signal against the engine's
+own reading, with the method's closed concept list — not the old level-bot rulebook.
+
+Why (the 22 Oct NIFTY "15M Dynamic SR" E4 (b) bear call that Vision called "disagree"): for `signal_source = engine` the worker sent
+the engine's entry through the level-bot audit (vision/signal_audit.py, `signal_check_v2_2`): the single L line card ("reclaimed /
+held R"), PDH / PDL / PDC, ORH / ORL, the gap classes G1–G5 / gap fill, "opening", "event_day", and `role_conflict` from that
+session's behaviour. Those code rules (DISAGREE_RULES / GRAY_RULES, `code_verdict`) set a verdict FLOOR, so a session / gap / clock
+fact could force "disagree" on a signal that is valid under the engine's concepts. The method forbids that framing for chart reading.
+
+Now, for an engine signal (`tags["engine"] is True`, written only by paper/engine_entry.py) and the Vision setting
+`vision_engine_audit = engine` (default; `legacy` = the old audit, a what-if):
+  • card — vision/engine_card.py: the engine's chart (visited area faint, refined base strong, the broken object of E4 (b), the trigger
+    candle, the invalidation, the next area, the HTF strip); no L line, no session separators, no gap / opening overlays;
+  • checklist — the method's concepts only: trend side, area alive / lifecycle state, visit, trigger traded into the refined base,
+    invalidation side, model rule, evidence (listed, never decides);
+  • floor — only Vision's own checklist (a failed concept ⇒ disagree, an unclear concept ⇒ gray); the old session / gap / opening /
+    L-line rules are computed as CONTEXT LINES only (`rule_hits[i]["context_only"]`) and never set the verdict;
+  • text — engine facts only: no day / date / session / clock framing, no fixed numbers in the reading rules (tests pin both).
+Vision stays advisory (human_confirm: Abhi decides; reduce-only): nothing here places, blocks or changes an order. Level-bot signals
+(`signal_source = own`) never reach this module — their audit is byte-identical (tests pin it). No API call happens in tests.
+"""
+import base64
+import json
+import re
+import time
+
+from atp_private.trade_engine.vision.method_block import OBJECT_STATES
+
+# v5 (M56 V2): the object-state words are the ONE shared BREAK-2 block (vision/method_block.OBJECT_STATES)
+PROMPT_VERSION = "engine_check_v5"            # v4 (N10): the reason in English; v3 (Abhi 28 Oct): Vision is the TRADER (takes / waits / skips), the whole 15M / 5M card; v2 (DECISIONS 38–41)
+MODEL_C_VERSION = PROMPT_VERSION + "+c"            # a model C card (DECISIONS 32): + the model C system block
+SETTING = "vision_engine_audit"
+MODES = ("engine", "legacy")
+DEFAULT = "engine"                      # PROVISIONAL (DECISIONS 31): review with the verdict-vs-outcome table (vision/engine_measure.py)
+VERDICTS = ("agree", "gray", "disagree")
+STATUSES = ("pass", "fail", "unclear")
+ITEMS = (                               # (key, card name) — the method's closed concept list (CHART_READER_METHOD §3–§4, §8), in order
+    ("trend_side", "Trend side"),
+    ("area_state", "Area alive / lifecycle"),
+    ("visit", "Visit"),
+    ("trigger_in_base", "Trigger in the base"),
+    ("invalidation_side", "Invalidation side"),
+    ("model_rule", "Model rule"),
+    ("evidence", "Evidence (listed, never decides)"),
+)
+KEYS = tuple(k for k, _ in ITEMS)
+VERDICT_ITEMS = tuple(k for k in KEYS if k != "evidence")   # evidence is listed and never blocks (CLAUDE.md entry framework)
+NOTE_MAX = 160
+REASON_MAX = 160
+ICON = {"pass": "✓", "fail": "✗", "unclear": "?"}
+SEVERITY = {"agree": 0, "gray": 1, "disagree": 2}
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "checklist": {"type": "object", "additionalProperties": False, "required": list(KEYS),
+                      "properties": {k: {"type": "object", "additionalProperties": False, "required": ["status", "note"],
+                                         "properties": {"status": {"type": "string", "enum": list(STATUSES)},
+                                                        "note": {"type": "string"}}} for k in KEYS}},
+        "verdict": {"type": "string", "enum": list(VERDICTS)},
+        "reason": {"type": "string"},
+        "confidence": {"type": "number"},
+    },
+    "required": ["checklist", "verdict", "reason", "confidence"],
+    "additionalProperties": False,
+}
+
+SYSTEM_PROMPT = """ROLE
+You are the trader. You trade NSE index options by price action: a bull put spread at demand, a bear call spread at supply, held
+across the swing. A rule-based chart reader (the engine) has found a setup and drawn it on the card; it is your trade to take or
+leave. Look at the whole chart yourself, as a trader who must put risk on it: read the structure, the area, the visit and the trigger
+candle with the method below, then decide whether YOU take this trade now. You are not a second opinion, not an adviser and not a
+guide: you are the trader making the call. Your call is recorded with the signal; you never place, size, move or close an order
+yourself (the owner's approval stays the only way an entry is placed, and exits are never blocked).
+
+THE CARD
+One image with these panels and a futures volume pane under each, and a strip at the top with the higher-timeframe states.
+- Left, the setup timeframe (15M): the whole recent structure — the move into the area, the area, the visit and the trigger.
+- Middle, only when the trigger is on 5M, the trigger timeframe (5M): the candles leading into the visit and the whole visit up to the
+  trigger candle.
+- Right, the higher timeframe candles.
+Drawn: the visited area (faint band, "AREA"), the refined base inside it (strong band, "BASE"), for E4 (b) the broken object being
+retested (dashed band or line, "BROKEN"), the trigger candle (yellow box, "T"), the invalidation (dashed yellow line, "INV"), the next
+area in the trade direction (outlined band, "NEXT"); other areas are faded. Every price is in the text; never read or invent a price
+from the image.
+
+THE METHOD (a closed concept list: judge only with these concepts)
+- Read the chart as one continuous unit, by structure only. A gap is simply the next candle.
+- Trend side: trade only in the direction of the higher-timeframe trend; a correction in progress does not change the trend. Never a
+  counter-trend entry, never a breakout entry, never a chase.
+- Area: an area is built from one base (wick to body), never from joined bases. Its lifecycle (and a line's) uses only the words of
+  OBJECT STATES below.
+- Visit: begins when price enters the area and ends only by structure (a swing built away from the area, a break, a flip, or a failed
+  commitment). Candles that close just outside and come back are the same visit.
+- Refined base and trigger: the higher-timeframe area is the context; the refined 15M base inside it gives the trigger location and
+  the invalidation. The trigger candle itself must trade into the refined base (its range overlaps the base); touching only the wider
+  area is not enough. A close outside the area on the trade side is the confirmation and is allowed; a close beyond on the
+  invalidation side is not. E4 (b): the rejection candle trades at the retested broken object and closes on its trade side.
+- Invalidation side: price must not be beyond the invalidation now. A candle that gaps or closes through the invalidation side is the
+  area breaking, not an entry. A sweep or a false break already back inside is not beyond.
+- Models, each at most once per visit: E1 aggressive = the visit's first candle at the refined base (it does not come back after a
+  sweep); E2 confirmation = a commitment candle after a handover; E3 structure = a lower-timeframe change of character after price
+  entered the area; E4 (a) sweep-retest = after a sweep or a false break of an ALIVE object the next push fails inside the sweep
+  extreme (invalidation beyond the sweep extreme); E4 (b) = only after BROKEN, price comes back from the other side to the BROKEN
+  (flipped) area or line and is rejected there (invalidation beyond the retest extreme). No entry of any model off an object that is
+  BEYOND_NOT_BROKEN. E2 and E3 never fire while the zone study reads absorption without a handover.
+- E4 (b) approach side: the retest of an object broken down (bear call) must come back UP to it from below and be rejected there
+  (mirror for a bull put). A candle coming from the object's original side, where price was accepted, and closing through it is a
+  breakout / breakdown candle, never an E4 (b). A line (like an area) flips only once: a BROKEN line broken back by the same test is
+  DEAD and is never a retest object again.
+- Range: when a timeframe is in a range (later swings fail to make a new extreme on both sides), the range edges are the areas — bear
+  call at the upper edge, bull put at the lower edge. An entry at the wrong end of a range (its invalidation at the opposite edge) is
+  not the method's trade location.
+- A line object is a line (a price on the line at the trigger), with its timeframe; it is not an area band.
+- Evidence (listed, never blocks): a handover (slow form: trend-side candles grow while the other side shrinks; fast form: a rejected
+  push taken back by a dominant opposite candle), a commitment candle on higher futures volume than the candles it is compared with,
+  a lower-timeframe change of character, volume growing inside the area, RSI divergence, confluence (a line or a higher-timeframe area
+  on the area), a correction line closed through at the area. A missing piece is reported; it is never by itself a reason to disagree.
+- Comparisons only (larger, smaller, beyond, inside, the same structure); no fixed sizes, ratios or counts.
+
+""" + OBJECT_STATES + """
+YOUR TASK
+Decide as the trader. First fill the checklist from the chart and the text — it is your own read of the trade, item by item. Every
+item has a status (pass / fail / unclear) and a note of at most one short English sentence:
+  trend_side, area_state, visit, trigger_in_base, invalidation_side, model_rule, evidence (pass = at least one confirming piece is
+  visible, fail = none; this item never decides the call).
+verdict = your trade decision: "agree" = I take this trade (every item except evidence passes); "gray" = I wait, the chart is not
+clear enough to put risk on (an item is unclear or mixed); "disagree" = I do not take this trade (an item except evidence fails).
+reason: one short sentence in simple English, in the first person as the trader, naming the deciding concept.
+confidence: how sure you are of your decision, from zero to one.
+Reply with the JSON object only."""
+
+# V1 (owner order 28 Oct: "Vision is not a guide, not an advisor, not a second opinion — Vision is a TRADER"): the trader prompt. The
+# method block is the same closed concept list; the role, the card and the task are the trader's. English only (DECISIONS 105).
+TRADER_VERSION = "trader_v2"            # v2 (M56 V2): the shared BREAK-2 OBJECT STATES block in its METHOD_BLOCK
+TRADER_PREFIX = "trader_"               # every trader version (stored trader_v1 audits still validate as trader audits)
+METHOD_BLOCK = SYSTEM_PROMPT[SYSTEM_PROMPT.index("THE METHOD ("):SYSTEM_PROMPT.index("YOUR TASK")]
+DECISIONS_T = ("TAKE", "SKIP", "WAIT")
+YES_PARTLY_NO = ("yes", "partly", "no")
+VERDICT_OF = {"TAKE": "agree", "WAIT": "gray", "SKIP": "disagree"}     # the store / gate shape (information only — the owner's ✅ decides)
+TRADER_TEXT_FIELDS = ("trend_side", "location_quality", "visit_story", "handover_commitment", "room", "invalidation", "wrong_if",
+                      "wait_for", "wave_position", "plan")      # M56 V6: wave_position = Elliott as information only (never the decision)
+TRADER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": list(DECISIONS_T)},
+        **{k: {"type": "string"} for k in TRADER_TEXT_FIELDS},
+        "engine_claim_matches": {"type": "string", "enum": list(YES_PARTLY_NO)},
+        "confidence": {"type": "number"},
+    },
+    "required": ["decision", *TRADER_TEXT_FIELDS, "engine_claim_matches", "confidence"],
+    "additionalProperties": False,
+}
+TRADER_SYSTEM = """ROLE
+You are the trader. You trade NSE index options by price action: a bull put spread at demand, a bear call spread at supply, held
+across the swing. Read the charts yourself and decide TAKE, SKIP or WAIT. A rule-based chart reader (the engine) found this setup; its
+labels are listed last in the text as "the engine says" — read the chart first, then compare. You are not a guide, not an adviser and
+not a second opinion: you are the trader making the call. Your call is recorded with the signal; you never place, size, move or close
+an order yourself (the owner's approval is the only way an entry is placed, and exits are never blocked).
+
+THE CARD
+One image: the setup timeframe (15M) panel from the area's origin through the approach, the whole visit and the trigger; when the
+trigger is on 5M, a 5M panel from the approach to the trigger; the higher timeframe (1H) panel covering the area's origin; a Daily panel
+with its swings and the area; an RSI pane and a futures volume pane. Marked: the visited area (faint), the refined base (strong), the
+trigger candle (yellow box, "T"), the invalidation (dashed, "INV"), the next opposite area ("NEXT"), the visit start ("visit"), the
+visit extreme ("VX"), the approach start ("A"), for E4 (b) the break candle ("BRK") and the higher-timeframe trend swings (HH / HL / LH / LL). The Weekly state is in the
+text. Every price is in the text; never read or invent a price from the image.
+
+""" + METHOD_BLOCK + """YOUR DECISION
+Decide as the trader who must put risk on this now:
+  decision: TAKE (you take this trade now), SKIP (you do not take it) or WAIT (not yet — say exactly what must happen first).
+  trend_side: what Weekly, Daily, 1H and 15M show and whether this trade is on the trend side.
+  location_quality: how good the area is as a location (fresh / tested, its origin, confluence, where price sits in it).
+  visit_story: how price came in (the approach), the visit's first candle, its extreme, whether it reached or swept the object.
+  handover_commitment: the handover and the commitment candle (its form, size, close position in its range, its volume).
+  room: the room from the entry to the next opposite area.
+  invalidation: where the trade is wrong by structure.
+  wrong_if: what would make this trade wrong after entry.
+  wait_for: for WAIT, exactly what to wait for; otherwise "nothing".
+  plan: one short sentence — the decision and the reason a trader would give.
+  engine_claim_matches: yes / partly / no — does the engine's reading match what the chart shows.
+  confidence: how sure you are of your decision, from zero to one.
+Every text field is one short English sentence.
+
+INFORMATION ONLY (never part of the decision)
+  wave_position: where this setup sits in the Elliott count on each timeframe that shows one, and the ends it rules out; "unclear"
+    when the count is not clear. It is information for the owner: it never decides, changes or blocks the call above.
+Reply with the JSON object only."""
+
+
+# Model C (DECISIONS 32; OPEN_QUESTIONS: P4 vs DECISIONS 32, provisional — DECISIONS 32 wins for model C only). A SECOND system block, sent
+# only with a model C card: SYSTEM_PROMPT (and its cache) stays byte-identical for every other engine signal.
+MODEL_C_SYSTEM = """MODEL C (this card only; an owner decision)
+This signal is model C: a separate, switchable model for the C leg of a correction against the Daily side. It is the one exception to
+"never a counter-trend entry". Its trade side is the correction's own direction: the Daily side is the other way, a 1H change of
+character began wave A, wave B is a corrective pullback still in progress (no close beyond the end of A, except the first return to it
+when the facts say so), and B has not died (a close beyond the origin O and a swing formed beyond O). Judge trend_side by this rule;
+judge every other item as for any signal. It is still a pullback or retest entry, never a breakout entry."""
+
+
+# DECISIONS 37 (the entry trigger on 5M): a THIRD system block, sent only with a 5M-trigger card — SYSTEM_PROMPT (and its cache) stays
+# byte-identical for every 15M-trigger signal.
+TRIGGER_5M_SYSTEM = """TRIGGER ON 5M (this card; an owner decision)
+The areas come from the 1H / Daily timeframes, the refined base from the 15M timeframe, and the trigger candle from the 5M timeframe. The
+middle panel is the 5M trigger panel: the 5M candles leading into the visit and the whole visit up to the trigger candle (yellow box, "T"),
+the refined 15M base (strong band), the context area (faint), the invalidation (dashed, "INV") and, when present, the 5M CHoCH level, the
+sweep extreme with the failed 5M push, or the broken line's value on each 5M candle. On the 15M setup panel the box marks the 15M bar that
+contains the 5M trigger; that 15M bar may still be in progress at the trigger, and the reading above the trigger (trend, areas, refined
+base, visit) uses only 15M / 1H / Daily bars closed at the 5M close. Judge trigger_in_base and invalidation_side on the 5M trigger candle:
+it must trade into the refined base; a close beyond on the invalidation side is not allowed; the invalidation stays the structural one
+(refined base / area / object / sweep extreme), never the 5M candle's own extreme."""
+
+
+def is_trigger_5m(sig):
+    """A 5M-trigger card: tags["entry_trigger_tf"] == "5M" (paper/engine_entry.trigger_tags, DECISIONS 37)."""
+    return str(_tags(sig).get("entry_trigger_tf") or "").upper() == "5M"
+
+
+def is_model_c(sig):
+    """A model C card: tags["entry_family"] == "C" (paper/engine_entry.model_c_tags)."""
+    return str(_tags(sig).get("entry_family") or "").upper() == "C"
+
+
+def is_trader(sig):
+    """V1 (owner order 28 Oct): the engine card's Vision is the TRADER (`vision_engine_prompt = trader_v1`, default); "engine_check" =
+    the checklist audit (what-if)."""
+    v = str(((sig or {}).get("ctx_settings") or {}).get("vision_engine_prompt", TRADER_VERSION) or TRADER_VERSION).lower()
+    return v != "engine_check"
+
+
+def prompt_version(sig):
+    """The audit's prompt version for this card: "trader_v2" (V1, default) or "engine_check_v5" (what-if); "+c" for a model C card (its
+    extra system block), "+5m" for a 5M trigger — stamped on the audit (validate), the result (audit) and the worker's reuse lookup."""
+    base = TRADER_VERSION if is_trader(sig) else PROMPT_VERSION
+    return base + ("+c" if is_model_c(sig) else "") + ("+5m" if is_trigger_5m(sig) else "")
+
+
+# ------------------------------------------------------------------------------------------------------------------ which signals
+def _tags(sig):
+    t = (sig or {}).get("tags")
+    return t if isinstance(t, dict) else {}
+
+
+def is_engine(sig):
+    """An engine signal = tags["engine"] is True (paper/engine_entry.py — `signal_source = engine`); every other signal (level bots,
+    manual, the level bots' own confirmation gate) is not."""
+    return _tags(sig).get("engine") is True
+
+
+def mode_of(sig):
+    v = str(((sig or {}).get("ctx_settings") or {}).get(SETTING, DEFAULT) or DEFAULT).lower()
+    return v if v in MODES else DEFAULT
+
+
+def use_engine(sig):
+    """The engine audit applies: an engine signal and `vision_engine_audit = engine` (default)."""
+    return is_engine(sig) and mode_of(sig) == "engine"
+
+
+def engine_ctx(ctx):
+    """The signal's context was built for the engine audit (vision/chart.render marks it) — the worker's reuse path re-applies the code
+    facts on this ctx, so the marker routes it to this module's rules."""
+    return isinstance(ctx, dict) and ctx.get("signal_source") == "engine"
+
+
+# ------------------------------------------------------------------------------------------------------------------ the reading
+def _num(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None
+
+
+def _band(lo, hi):
+    a, b = _num(lo), _num(hi)
+    return None if a is None or b is None else (min(a, b), max(a, b))
+
+
+def _inv(x):
+    """entry_invalidation: a price, or {price, rule} (engine3_live._invalidation_of) ⇒ (price | None, rule | None)."""
+    if isinstance(x, dict):
+        return _num(x.get("price")), (None if x.get("rule") is None else str(x["rule"]))
+    return _num(x), None
+
+
+ALIVE = ("FRESH", "TESTED", "ACTIVE", "SWEPT", "ARMED", "VALID", "FLIPPED")
+
+
+def next_area(d, ref, areas):
+    """The next area in the trade direction (Abhi's target area: the next opposite area): the nearest area of the opposite role whose
+    near edge lies beyond `ref` on the trade side (bear call ⇒ demand below, bull put ⇒ supply above), not broken / dead. Comparison
+    only. ⇒ {role, lo, hi, state, source} | None."""
+    want = "support" if d < 0 else "resistance"
+    if ref is None:
+        return None
+    best = None
+    for a in areas or []:
+        b = _band(a.get("lo"), a.get("hi"))
+        st = str(a.get("state") or "").upper()
+        if b is None or str(a.get("role") or "").lower() != want or (st and st not in ALIVE):
+            continue
+        near = b[1] if d < 0 else b[0]
+        if (d < 0 and near >= ref) or (d > 0 and near <= ref):
+            continue
+        if best is None or (d < 0 and near > best["hi"]) or (d > 0 and near < best["lo"]):
+            best = {"role": want, "lo": b[0], "hi": b[1], "state": st or None, "source": a.get("source") or "engine"}
+    return best
+
+
+def reading(sig, fallback_areas=None):
+    """The engine's own reading of this signal, from the signal tags only (nothing re-read): model, object, trend / HTF strip, the
+    visited area, the refined base, the broken object (E4 (b)), the trigger, the invalidation, the next area, cluster, evidence.
+    fallback_areas (chart bands at signal time, no look-ahead) give the next area only when the engine row carries no opposite area."""
+    t = _tags(sig)
+    g = t.get("gate") if isinstance(t.get("gate"), dict) else {}
+    d = 1 if str((sig or {}).get("direction", "")).upper().startswith("BULL") else -1
+    area = _band(*(list(g.get("area") or []) + [None, None])[:2])
+    areas = [a for a in (g.get("areas") or []) if isinstance(a, dict)]
+    me = next((a for a in areas if area is not None and _band(a.get("lo"), a.get("hi")) == area), {})
+    rb = g.get("refined") if isinstance(g.get("refined"), dict) else {}
+    model = str(t.get("entry_model") or "").upper() or None
+    name = t.get("entry_name")
+    obj = t.get("entry_object") or me.get("object")
+    if obj is None and model == "E4" and "(b)" in str(name or ""):
+        obj = "broken_line" if str(me.get("tf") or "") == "line" else "broken_area"
+    obj = obj or ("area" if area is not None else None)
+    ip, rule = _inv(t.get("entry_invalidation"))
+    if ip is None:
+        ip = _num((sig or {}).get("invalidation"))
+    ref = _num(t.get("entry_ref"))
+    if ref is None:
+        ref = _num((sig or {}).get("spot"))
+    if "next_area" in g:                                                 # layer 6: the engine's own next opposite area (the target) —
+        na = g.get("next_area")                                          # None = the engine knows none ahead ⇒ "none known"
+        b = _band(na.get("lo"), na.get("hi")) if isinstance(na, dict) else None
+        nxt = None if b is None else {"role": "support" if d < 0 else "resistance", "lo": b[0], "hi": b[1],
+                                      "state": str(na.get("state") or "").upper() or None, "source": "engine", "tf": na.get("tf")}
+    else:                                                                # an older row: today's reading (gate areas, then the chart bands)
+        nxt = next_area(d, ref, areas)
+    if nxt is None and fallback_areas and "next_area" not in g:
+        nxt = next_area(d, ref, [{"role": a.get("role"), "lo": a.get("lo"), "hi": a.get("hi"), "source": "chart band finder",
+                                  "state": "BROKEN" if a.get("broken") and not a.get("valid") else (a.get("state") or "")}
+                                 for a in fallback_areas if isinstance(a, dict)])
+    ev = t.get("entry_evidence")
+    ev = [[str(x[0]), str(x[1])] for x in ev if isinstance(x, (list, tuple)) and len(x) >= 2] if isinstance(ev, list) else []
+    htf = g.get("htf") if isinstance(g.get("htf"), dict) else {}
+    cl = g.get("cluster") if isinstance(g.get("cluster"), dict) else None
+    mc = None
+    if str(t.get("entry_family") or "").upper() == "C":                 # model C (DECISIONS 32): its own facts for trend_side
+        c = t.get("entry_model_c") if isinstance(t.get("entry_model_c"), dict) else {}
+        mc = {"sub_model": t.get("entry_sub_model"), "story": t.get("entry_story"), "daily": (c.get("daily") or {}).get("trend"),
+              "weekly": c.get("weekly"), "O": _num((c.get("O") or {}).get("price")), "HA": _num((c.get("HA") or {}).get("price")),
+              "B": _num((c.get("B") or {}).get("price")), "a_nature": (c.get("a_nature") or {}).get("verdict"),
+              "b_nature": (c.get("b_nature") or {}).get("verdict"), "window": c.get("window"),
+              "invalidated_if": c.get("invalidated_if")}
+    return {"direction": d, "side": "bull put" if d > 0 else "bear call", "model": model, "name": name, "label": t.get("entry_label"),
+            "grade": g.get("grade"), "evidence_words": _ev_words(g), "object": obj, "trend": g.get("trend"), "htf": htf or None,
+            "area": None if area is None else {"lo": area[0], "hi": area[1], "tf": me.get("tf") or g.get("tf"), "state": me.get("state"),
+                                               "id": me.get("id"), "role": "support" if d > 0 else "resistance"},
+            "refined": _band(rb.get("lo"), rb.get("hi")), "trigger_ts": t.get("entry_trigger_ts"), "entry_ref": ref,
+            "invalidation": ip, "invalidation_rule": rule, "next_area": nxt, "evidence": ev,
+            "cluster": None if not cl else {"n": cl.get("n"), "members": t.get("entry_cluster")},
+            "others": [{"role": a.get("role"), "lo": _num(a.get("lo")), "hi": _num(a.get("hi")), "state": a.get("state")}
+                       for a in areas if _band(a.get("lo"), a.get("hi")) not in (area,)], **({"model_c": mc} if mc else {}),
+            **({"line": t["entry_line"]} if isinstance(t.get("entry_line"), dict) else {}),          # DECISIONS 41: the line, its TF
+            **({"trigger_tf": str(t["entry_trigger_tf"]).upper(),
+                "trigger": t.get("entry_trigger") if isinstance(t.get("entry_trigger"), dict) else {}}
+               if t.get("entry_trigger_tf") else {}),                                                # DECISIONS 37: the 5M trigger
+            **({"range_edge": t["entry_range_edge"]} if isinstance(t.get("entry_range_edge"), dict) else {})}   # DECISIONS 40
+
+
+def _p(x):
+    return "n/a" if x is None else f"{float(x):,.2f}"
+
+
+LABEL_PIECE_NAMES = ("RSI divergence", "volume growing inside", "confluence", "correction line closed through",
+                     "counter channel broken")             # decision3/entry_models.LABEL_PIECES, as the evidence list names them
+
+
+def _ev_words(g):
+    from . import card_summary as CS
+    rd = g.get("reader") if isinstance(g.get("reader"), dict) else {}
+    return CS.evidence_count_words(rd.get("evidence_list")) or None
+
+
+def label_words(rd):
+    """Layer 6 / DECISIONS 54 (owner rule, method §5): the entry's A / B label as the engine output it — " | label A (the model's own
+    conditions + at least one confirming piece: …)" naming the confirming piece(s) present in the engine's evidence list, " | label B
+    (the model's own conditions only)", or — only under the old 6a what-if (`label_rule = legacy`) — " | no A / B label (the legacy 6a
+    required set reads absent)". The model's own name is never printed as the label. No entry model ⇒ "". DECISIONS 58 (default): no A / B
+    label — " | evidence: 2 of 5 — confluence, RSI divergence · NA: … (information only)"."""
+    cw = rd.get("evidence_words")
+    if cw:                                                               # DECISIONS 58: no A / B label — the evidence count (info only)
+        return f" | {cw} (information only)"
+    g = rd.get("grade")
+    if g == "A":
+        ev = rd.get("evidence") if isinstance(rd.get("evidence"), list) else []
+        got = [str(x[0]) for x in ev if isinstance(x, (list, tuple)) and len(x) >= 2 and x[0] in LABEL_PIECE_NAMES and x[1] == "✓"]
+        return " | label A (the model's own conditions + at least one confirming piece" + (f": {', '.join(got)})" if got else ")")
+    if g == "B":
+        return " | label B (the model's own conditions only)"
+    return " | no A / B label (the legacy 6a required set reads absent)" if rd.get("model") else ""
+
+
+OBJECT_WORDS = {"area": "the visited area", "broken_area": "a broken (flipped) area being retested from the other side",
+                "broken_line": "a broken line being retested from the other side"}
+
+
+def facts_text(sig, rd=None):
+    """The engine facts Vision audits against — exact prices from the engine data; no day / date / session / clock words."""
+    rd = rd or reading(sig)
+    a, nx = rd["area"], rd["next_area"]
+    h = rd["htf"] or {}
+    lines = [
+        f"Signal: {sig.get('symbol')} | {rd['side']} ({'bullish' if rd['direction'] > 0 else 'bearish'}) | setup timeframe 15M"
+        + (" | areas 1H / Daily, refined base 15M, trigger 5M" if rd.get("trigger_tf") == "5M" else ""),
+        "Entry model: " + (f"{rd['model']} {rd['name'] or ''}".strip() if rd["model"] else "the engine's setup (no entry model)")
+        + label_words(rd) + ".",
+        f"Trend side (engine): {rd['trend'] or 'n/a'}"
+        + (f" | Weekly {h.get('weekly')}" if h.get("weekly") else "") + (f" | Daily {h.get('daily')}" if h.get("daily") else "")
+        + (f" ({h.get('daily_phase')})" if h.get("daily_phase") else "") + ".",
+        f"Object: {OBJECT_WORDS.get(rd['object'], rd['object'] or 'n/a')}.",
+    ]
+    ln, re_ = rd.get("line"), rd.get("range_edge")
+    if a and (ln or rd["object"] == "broken_line"):                      # DECISIONS 41: a line object is a line with its timeframe
+        ln = ln or {}
+        frm = "below" if rd["direction"] < 0 else "above"
+        brk = {"down": "broken down", "up": "broken up"}.get(str(ln.get("break_side") or ""), "broken")
+        lines.append(f"Retested object: broken {ln.get('tf') or ''} line".replace("  ", " ")
+                     + (f" ({ln['family']}, {brk})" if ln.get("family") else f" ({brk})")
+                     + f" at {_p(a['lo'])} at the trigger; retest from {frm} — price must come back to the line from the break side and "
+                       f"be rejected there | state {a.get('state') or 'n/a'}.")
+    elif a and re_:                                                      # DECISIONS 40: a range edge = the area
+        lines.append(f"Visited area: {re_.get('tf') or ''} range {re_.get('edge')} edge ({a['role']} side): band {_p(a['lo'])} - "
+                     f"{_p(a['hi'])} | state {a.get('state') or 'n/a'}.")
+    elif a:
+        kind = "line value" if a["lo"] == a["hi"] else "band"
+        lines.append(f"{'Retested object' if str(rd['object'] or '').startswith('broken') else 'Visited area'} ({a['role']} side, "
+                     f"{a.get('tf') or 'n/a'}): {kind} {_p(a['lo'])}" + ("" if a["lo"] == a["hi"] else f" - {_p(a['hi'])}")
+                     + f" | state {a.get('state') or 'n/a'}.")
+    else:
+        lines.append("Visited area: not in the signal.")
+    rb = rd["refined"]
+    lines.append(f"Refined 15M base: {_p(rb[0])} - {_p(rb[1])}." if rb else
+                 "Refined 15M base: none in the signal" + (" (E4 (b) is judged at the retested object)." if str(rd['object'] or '')
+                                                             .startswith("broken") else "."))
+    if rd.get("trigger_tf") == "5M":                                    # DECISIONS 37: the 5M trigger candle, its own panel
+        tr = rd.get("trigger") or {}
+        oh = tr.get("ohlc") or {}
+        lines.append("Trigger candle (5M): boxed T on the 5M trigger panel (the chart ends at its close); the 15M bar containing it is "
+                     "boxed on the setup panel" + (f"; 5M candle open {_p(oh.get('open'))} high {_p(oh.get('high'))} low "
+                                                   f"{_p(oh.get('low'))} close {_p(oh.get('close'))}" if oh.get("close") is not None else "")
+                     + (f"; its close (entry reference) {_p(rd['entry_ref'])}" if rd["entry_ref"] is not None else "")
+                     + "; context = the last closed 15M bar.")
+    else:
+        lines.append("Trigger candle: boxed and marked T on the setup panel (the chart ends at its close)"
+                     + (f"; its close (entry reference) {_p(rd['entry_ref'])}." if rd["entry_ref"] is not None else "."))
+    lines.append(f"Invalidation: {_p(rd['invalidation'])}" + (f" ({rd['invalidation_rule']})" if rd.get("invalidation_rule") else "")
+                 + ".")
+    lines.append(f"Next area in the trade direction: {nx['role']} {_p(nx['lo'])} - {_p(nx['hi'])}"
+                 + (f" ({nx['source']})" if nx.get("source") and nx["source"] != "engine" else "") + "." if nx else
+                 "Next area in the trade direction: none known.")
+    from . import card_summary as CS
+    rv = CS.room_vs_invalidation(_tags(sig))                             # M54 V-8: one information line, never a gate
+    if rv:
+        lines.append(rv[0].upper() + rv[1:] + " (information only).")
+    mc = rd.get("model_c")
+    if mc:                                                               # DECISIONS 32: the C leg's own trend-side rule (advisory audit)
+        lines.append(f"Model C ({mc.get('sub_model') or 'C'}, owner decision — a separate switchable model, not the Daily-side rule): "
+                     f"the counter-trend C leg of a correction against the Daily side. Daily side {mc.get('daily') or 'n/a'}"
+                     + (f", Weekly {mc['weekly']}" if mc.get("weekly") else "") + "; this trade is in the 1H correction's direction.")
+        lines.append(f"Model C structure (engine): origin O {_p(mc.get('O'))}; wave A from O made a 1H change of character, its nature "
+                     f"{mc.get('a_nature') or 'n/a'}, ended at HA {_p(mc.get('HA'))}; wave B {mc.get('b_nature') or 'n/a'}, extreme so "
+                     f"far {_p(mc.get('B'))}; window: {mc.get('window') or 'n/a'}; {mc.get('invalidated_if') or ''}.")
+        lines.append("Trend side for this model C signal passes when: the Daily side is opposite to this trade, a 1H change of "
+                     "character began wave A, B is a corrective pullback still in progress (or the first return to HA when the window "
+                     "says so) and B has not closed beyond O with a swing formed beyond O. Judge trend_side by this rule.")
+    if rd.get("cluster") and rd["cluster"].get("n"):
+        lines.append("Cluster: overlapping areas of the same role count as one place (one signal per model); the edges, trigger and "
+                     "invalidation above come from the visited area only.")
+    from . import card_summary as CS
+    for x in ([] if is_trader(sig) else CS.structure_facts(_tags(sig))):   # G5 / C3 (28 Oct); the trader reads them with the chart facts
+        lines.append(x + ".")
+    if rd["evidence"]:
+        lines.append("Evidence list (engine; listed, never blocks): " + "; ".join(f"{n} {m}" for n, m in rd["evidence"]) + ".")
+    oth = [o for o in rd["others"] if o["lo"] is not None and o["hi"] is not None and str(o.get("state") or "").upper() != "DEAD"
+           and not (nx and (o["lo"], o["hi"]) == (nx["lo"], nx["hi"]))]
+    if oth:
+        lines.append("Other engine areas (faded on the chart): " + "; ".join(
+            f"{'supply' if o['role'] == 'resistance' else 'demand'} {_p(o['lo'])} - {_p(o['hi'])} {str(o.get('state') or '').lower()}"
+            .strip() for o in sorted(oth, key=lambda z: -z["hi"])) + ".")
+    if is_trader(sig):                                                   # V5: the chart facts first, the engine's labels last
+        cf = chart_fact_lines(sig)
+        return "\n".join(cf + ["The engine says (read the chart first, then compare):"] + ["  " + x for x in lines]
+                         + ["Decide TAKE / SKIP / WAIT as the trader and fill the JSON."])
+    lines.append("Audit this signal against the method and fill the checklist JSON.")
+    return "\n".join(lines)
+
+
+def chart_fact_lines(sig):
+    """V5 (DECISIONS 103): the chart's own facts for the trader, from the card's candles (vision/chart.engine_chart_facts, stored in the
+    signal context) — the visit's first candle, its extreme, reached / swept the object, the side price came from, the room to the next
+    area, the trigger's age; plus the opening gap and the pullback form (G5 / C3). [] when none were read."""
+    f = ((sig or {}).get("ctx") or {}).get("engine_chart_facts") if isinstance((sig or {}).get("ctx"), dict) else None
+    out = ["Chart facts (from the candles):"] if f else []
+    f = f or {}
+    v0 = f.get("visit_first")
+    if v0:
+        out.append(f"Visit first candle (15M): open {_p(v0['open'])} high {_p(v0['high'])} low {_p(v0['low'])} close {_p(v0['close'])}.")
+    if f.get("visit_extreme") is not None:
+        out.append(f"Visit extreme so far: {_p(f['visit_extreme'])}" + (f" — {f['object_reach']}" if f.get("object_reach") else "") + ".")
+    if f.get("came_from"):
+        out.append(f"Price came into the area from {f['came_from']}.")
+    if f.get("approach_start") is not None:
+        out.append(f"Approach started at {_p(f['approach_start'])}.")
+    if f.get("room_pts") is not None:
+        out.append(f"Room from the entry to the next opposite area: {_p(f['room_pts'])} points"
+                   + (" — the trigger already reached it" if f.get("room_reached") else "") + ".")
+    if f.get("trigger_age_bars") is not None:
+        out.append(f"Trigger candle age: {int(f['trigger_age_bars'])} trigger-timeframe candle(s) closed since it.")
+    from . import card_summary as CS
+    out += [x + "." for x in CS.structure_facts(_tags(sig))]
+    return out
+
+
+# ------------------------------------------------------------------------------------------------------------------ request / parse
+def build_request(png, sig, model, max_tokens=None, effort=None, thinking=None, text=None):
+    from . import signal_audit as SA
+    if not model:
+        raise ValueError("VISION_SIGNAL_MODEL env not set")
+    params = {
+        "model": model,
+        "max_tokens": int(max_tokens or SA.max_output_tokens()),
+        "system": [{"type": "text", "text": TRADER_SYSTEM if is_trader(sig) else SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}]
+        + ([{"type": "text", "text": MODEL_C_SYSTEM}] if is_model_c(sig) else [])
+        + ([{"type": "text", "text": TRIGGER_5M_SYSTEM}] if is_trigger_5m(sig) else []),
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": base64.standard_b64encode(png).decode("utf-8")}},
+            {"type": "text", "text": text if text is not None else facts_text(sig)}]}],
+        "output_config": {"format": {"type": "json_schema", "schema": TRADER_SCHEMA if is_trader(sig) else SCHEMA}},
+    }
+    if effort:
+        params["output_config"]["effort"] = effort
+    if thinking:
+        params["thinking"] = {"type": thinking}
+    return params
+
+
+def validate_trader(raw, version=TRADER_VERSION):
+    """V1: (clean dict, error | None) — decision TAKE / SKIP / WAIT, the text fields (English, one sentence each), engine_claim_matches,
+    confidence. `verdict` = the store / gate shape of the decision (TAKE ⇒ agree, WAIT ⇒ gray, SKIP ⇒ disagree); `reason` = the plan."""
+    if not isinstance(raw, dict):
+        return None, "JSON object missing"
+    dec = str(raw.get("decision", "")).strip().upper()
+    if dec not in DECISIONS_T:
+        return None, f"decision invalid: {raw.get('decision')!r}"[:200]
+    out = {"decision": dec, "verdict": VERDICT_OF[dec]}
+    for k in TRADER_TEXT_FIELDS:
+        out[k] = " ".join(str(raw.get(k) or "").split())[:REASON_MAX]
+    m = str(raw.get("engine_claim_matches", "")).strip().lower()
+    if m not in YES_PARTLY_NO:
+        return None, f"engine_claim_matches invalid: {raw.get('engine_claim_matches')!r}"[:200]
+    out["engine_claim_matches"] = m
+    try:
+        conf = float(raw.get("confidence"))
+    except (TypeError, ValueError):
+        return None, "confidence invalid"
+    if conf != conf:
+        return None, "confidence NaN"
+    out["confidence"] = min(1.0, max(0.0, conf))
+    out["reason"] = out["plan"]
+    out["engine_check"] = version
+    return out, None
+
+
+# M56 V4 (C5): a price Vision types in a trader text field must be one of the facts_text prices (the prompt says "never read or invent a
+# price from the image"). Display / audit only — never changes an order or the decision. A "price" token = a number with at least
+# PRICE_MIN_DIGITS integer digits (an index price; timeframe / model / wave labels and small counts are not prices) — display constant.
+PRICE_MIN_DIGITS = 3
+_NUM_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?(?![\w])")
+PRICE_FLAG = "(price not in the facts)"
+
+
+def _prices(text):
+    out = []
+    for m in _NUM_RE.finditer(str(text or "")):
+        tok = m.group(0).rstrip(",")
+        try:
+            v = float(tok.replace(",", ""))
+        except ValueError:
+            continue
+        if len(tok.replace(",", "").split(".")[0]) >= PRICE_MIN_DIGITS:
+            out.append((tok, v))
+    return out
+
+
+def price_flags(a, facts):
+    """{field: [price tokens not in the facts text]} over the trader text fields (a price matches when it equals a facts price, or
+    both round to the same whole point). {} when every price is in the facts. Never raises."""
+    try:
+        known = {round(v) for _, v in _prices(facts)} | {round(v, 2) for _, v in _prices(facts)}
+        out = {}
+        for k in TRADER_TEXT_FIELDS:
+            bad = [t for t, v in _prices((a or {}).get(k)) if round(v, 2) not in known and round(v) not in known]
+            if bad:
+                out[k] = bad
+        return out
+    except Exception:                                                    # noqa: BLE001 — a display check only
+        return {}
+
+
+def validate(raw, version=PROMPT_VERSION):
+    """(clean dict, error | None). A missing item / status outside the enum / no verdict ⇒ error (⇒ unavailable). A trader version
+    (trader_v1 / trader_v2 …) ⇒ `validate_trader`."""
+    if str(version).startswith(TRADER_PREFIX):
+        return validate_trader(raw, version)
+    if not isinstance(raw, dict):
+        return None, "no JSON object"
+    ck = raw.get("checklist")
+    if not isinstance(ck, dict):
+        return None, "no checklist"
+    out = {"checklist": {}}
+    for k in KEYS:
+        it = ck.get(k)
+        st = str((it or {}).get("status", "")).strip().lower() if isinstance(it, dict) else ""
+        if st not in STATUSES:
+            return None, f"{k} invalid: {it!r}"[:200]
+        out["checklist"][k] = {"status": st, "note": str(it.get("note") or "").strip()[:NOTE_MAX]}
+    v = str(raw.get("verdict", "")).strip().lower()
+    if v not in VERDICTS:
+        return None, f"verdict invalid: {raw.get('verdict')!r}"
+    out["verdict"] = v
+    try:
+        conf = float(raw.get("confidence"))
+    except (TypeError, ValueError):
+        return None, "confidence invalid"
+    if conf != conf:
+        return None, "confidence NaN"
+    out["confidence"] = min(1.0, max(0.0, conf))
+    out["reason"] = str(raw.get("reason") or "").strip()[:REASON_MAX]
+    out["engine_check"] = version
+    return out, None
+
+
+def parse_message(message, version=PROMPT_VERSION):
+    from . import signal_audit as SA
+    usage = SA.usage_of(message)
+    stop = getattr(message, "stop_reason", None)
+    if stop == "refusal":
+        return None, "refusal", usage
+    if stop == "max_tokens":
+        return None, "max_tokens reached", usage
+    text = next((b.text for b in (getattr(message, "content", None) or []) if getattr(b, "type", None) == "text"), None)
+    if not text:
+        return None, "no text reply", usage
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        return None, f"JSON parse: {exc}", usage
+    data, err = validate(raw, version)
+    return data, err, usage
+
+
+def one_call(client, params, version=PROMPT_VERSION, sleep=time.sleep):
+    """(data, error, usage, latency_ms). Never raises. The call = signal_audit.create — the same connection retry and root-cause words
+    as every Vision path (29 Oct: the engine path had neither; the V7 re-runs reported a bare "Connection error.")."""
+    from . import signal_audit as SA
+    t0 = time.monotonic()
+    msg, err = SA.create(client, params, sleep)
+    if msg is None:
+        return None, err, {}, int((time.monotonic() - t0) * 1000)
+    data, err, usage = parse_message(msg, version)
+    return data, err, usage, int((time.monotonic() - t0) * 1000)
+
+
+# ------------------------------------------------------------------------------------------------------------------ verdict rules
+def apply_facts(a, ctx=None):
+    """Code facts the engine audit imposes (strict direction only): the trigger candle not closed yet ⇒ trigger_in_base unclear. No
+    session / gap / opening / L-line fact touches the engine checklist. ⇒ (a, changes)."""
+    if not a or not isinstance(a.get("checklist"), dict):
+        return a, []
+    a = {**a, "checklist": {k: dict(v) for k, v in a["checklist"].items()}}
+    ch = []
+    sb = (ctx or {}).get("signal_bar") or {}
+    it = a["checklist"].get("trigger_in_base") or {}
+    if sb and sb.get("closed") is False and it.get("status") == "pass":
+        it["status"] = "unclear"
+        ch.append("trigger_in_base=unclear (the trigger candle is not closed yet)")
+    return a, ch
+
+
+def rule_hits(a, ctx=None):
+    """(disagree ids, gray ids) from Vision's own checklist: a failed method concept ⇒ disagree, an unclear one ⇒ gray. Evidence is
+    listed and never counts. Nothing from the old level-bot rulebook. The trader (V1) has no checklist ⇒ ([], [])."""
+    if (a or {}).get("decision"):
+        return [], []
+    ck = (a or {}).get("checklist") or {}
+    d = [k for k in VERDICT_ITEMS if (ck.get(k) or {}).get("status") == "fail"]
+    g = [k for k in VERDICT_ITEMS if (ck.get(k) or {}).get("status") == "unclear"]
+    return d, g
+
+
+def code_verdict(a, ctx=None):
+    """The audit's verdict: the stricter of Vision's own verdict and its own checklist (never more positive than the checklist)."""
+    if not a:
+        return "unavailable"
+    if a.get("decision") in VERDICT_OF:                                  # V1: the trader's own decision — no checklist floor
+        return VERDICT_OF[a["decision"]]
+    d, g = rule_hits(a, ctx)
+    floor = "disagree" if d else ("gray" if g else "agree")
+    own = a.get("verdict") if a.get("verdict") in SEVERITY else "gray"
+    return max(floor, own, key=SEVERITY.get)
+
+
+def legacy_context(ctx, direction, disagree_rules=None, gray_rules=None):
+    """CONTEXT LINES only: the old level-bot rules (session / gap / opening / L line) on this signal's context, as the old audit would
+    have floored it with a neutral reading — {"disagree": [...], "gray": [...], "facts": [...]}. Never sets the engine verdict."""
+    from . import signal_audit as SA
+    if not isinstance(ctx, dict):
+        return {"disagree": [], "gray": [], "facts": []}
+    plain = {k: v for k, v in ctx.items() if k not in ("signal_source", "engine")}
+    if not plain:
+        return {"disagree": [], "gray": [], "facts": []}
+    try:
+        _, hits, facts = SA.pre_verdict(plain, direction, disagree_rules, gray_rules)
+    except Exception as exc:                                             # noqa: BLE001 — context only, never the verdict
+        return {"disagree": [], "gray": [], "facts": [], "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+    return {"disagree": list(hits.get("disagree") or []), "gray": [x for x in hits.get("gray") or [] if x != "unclear"], "facts": facts}
+
+
+def audit(client, png, sig, model, second_below=0.6, effort=None, thinking=None, on_usage=None, budget_ok=None, disagree_rules=None,
+          gray_rules=None):
+    """The engine audit — the same shape as signal_audit.audit ({verdict, audits, verdicts, confidence, cost_usd, usage, latency_ms,
+    error, prompt_version, model, rule_hits}) so the worker / gate / store paths stay as they are. rule_hits[i] = {"disagree": [concept
+    ids failed], "gray": [concept ids unclear], "context_only": the old rules' hits (context lines, never the verdict)}."""
+    from . import signal_audit as SA
+    ctx = sig.get("ctx")
+    rd = (ctx or {}).get("engine") if isinstance(ctx, dict) and isinstance(ctx.get("engine"), dict) else reading(sig)
+    ft = facts_text(sig, rd)
+    params = build_request(png, sig, model, effort=effort, thinking=thinking, text=ft)
+    pv = prompt_version(sig)
+    legacy = legacy_context(ctx, sig.get("direction"), disagree_rules, gray_rules)
+    out = {"audits": [], "verdicts": [], "cost_usd": 0.0, "latency_ms": 0, "error": None, "prompt_version": pv, "model": model,
+           "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_write": 0}, "rule_hits": []}
+    for n in range(2):
+        if n == 1:
+            first = out["audits"][0] if out["audits"] else None
+            if first is None or first["confidence"] >= second_below or (budget_ok is not None and not budget_ok()):
+                break
+        data, err, usage, ms = one_call(client, params, pv)
+        if not usage and err and err.startswith("API"):
+            usage = {"input_tokens": 2050, "output_tokens": SA.max_output_tokens(), "estimated": 1}   # as signal_audit.audit (budget)
+        c = SA.cost_usd(model, usage)
+        out["cost_usd"] += c
+        out["latency_ms"] += ms
+        for k in out["usage"]:
+            out["usage"][k] += usage.get(k, 0)
+        if on_usage is not None and usage:
+            on_usage(usage, c)
+        if err:
+            out["error"] = err
+            out["verdicts"].append("unavailable")
+            if n == 0:
+                break
+            continue
+        data, facts = apply_facts(data, ctx)
+        if facts:
+            data["code_overrides"] = facts
+        if data.get("decision"):                                         # M56 V4: the trader's typed prices vs the facts (audit only)
+            pf = price_flags(data, ft)
+            if pf:
+                data["prices_not_in_facts"] = pf
+        out["audits"].append(data)
+        out["verdicts"].append(code_verdict(data, ctx))
+        d, g = rule_hits(data, ctx)
+        out["rule_hits"].append({"disagree": d, "gray": g, "context_only": legacy})
+    out["verdict"] = SA.combine(out["verdicts"])
+    if len(out["verdicts"]) == 2 and out["verdicts"][1] == "unavailable" and out["verdict"] == "agree":
+        out["verdict"] = "gray"                                          # as signal_audit.audit
+    confs = [x["confidence"] for x in out["audits"]]
+    out["confidence"] = round(sum(confs) / len(confs), 3) if confs else None
+    out["cost_usd"] = round(out["cost_usd"], 6)
+    if not out["rule_hits"]:
+        out["rule_hits"] = [{"disagree": [], "gray": [], "context_only": legacy}]
+    return out
+
+
+# ------------------------------------------------------------------------------------------------------------------ card text
+def caption_lines(a, hits=None):
+    """Telegram details for an engine audit: one line per method concept (✓ / ✗ / ?) + the old rules as context lines (never the
+    verdict). HTML-escaped."""
+    import html
+    if (a or {}).get("decision"):                                        # V1: the trader's call and its plan, one line per field
+        return trader_lines(a)
+    out = []
+    names = dict(ITEMS)
+    for k in KEYS:
+        it = ((a or {}).get("checklist") or {}).get(k) or {}
+        out.append(f"{ICON.get(it.get('status'), '?')} {names[k]}" + (f" — {html.escape(it['note'])}" if it.get("note") else ""))
+    if (a or {}).get("code_overrides"):
+        out.append("Code facts: " + html.escape("; ".join(a["code_overrides"])))
+    if hits and (hits.get("disagree") or hits.get("gray")):
+        out.append("Rules: " + ", ".join([f"❌ {x}" for x in hits.get("disagree") or []] + [f"🟡 {x}" for x in hits.get("gray") or []]))
+    ctxo = (hits or {}).get("context_only") or {}
+    old = list(ctxo.get("disagree") or []) + list(ctxo.get("gray") or [])
+    if old:
+        out.append("Context only (earlier level checks, not in the verdict): " + html.escape(", ".join(old)))
+    return out
+
+
+def trader_lines(a):
+    """V1 card details: "Vision (trader): TAKE — <plan>" + the trader's read, one line per field (English, HTML-escaped)."""
+    import html
+    a = a or {}
+    pf = a.get("prices_not_in_facts") or {}                              # M56 V4: shown, never acted on
+
+    def mark(k):
+        return f" {PRICE_FLAG}" if pf.get(k) else ""
+    out = [f"Vision (trader): {a.get('decision')} — {html.escape(a.get('plan') or '')}{mark('plan')}"]
+    names = {"trend_side": "Trend side", "location_quality": "Location", "visit_story": "Visit", "handover_commitment": "Handover / commitment",
+             "room": "Room", "invalidation": "Invalidation", "wrong_if": "Wrong if", "wait_for": "Wait for"}
+    for k, w in names.items():
+        v = a.get(k)
+        if v and not (k == "wait_for" and v.strip().lower().rstrip(".") == "nothing"):
+            out.append(f"{w}: {html.escape(v)}{mark(k)}")
+    if a.get("wave_position"):                                           # M56 V6: Elliott, information only (details, never the caption)
+        out.append(f"Wave position (information only): {html.escape(a['wave_position'])}{mark('wave_position')}")
+    out.append(f"Engine claim matches the chart: {a.get('engine_claim_matches') or '?'}")
+    return out

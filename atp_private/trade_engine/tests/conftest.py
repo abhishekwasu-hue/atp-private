@@ -1,0 +1,335 @@
+"""
+tests/conftest.py
+--------------------
+🎓 Production-readiness फिक्स — tests/test_strategy_selection.py ला `sample_option_chain` fixture
+हवा होता, पण तो कुठेही परिभाषित (define) केलेला नव्हता (या रिपॉझिटरीच्या संपूर्ण इतिहासात कधीच
+conftest.py अस्तित्वातच नव्हता) — त्यामुळे pytest ने ती फाईल पहिल्यांदाच प्रत्यक्ष चालवल्यावर (आधी
+tests/ फोल्डरच नसल्याने ती कधीच चालतच नव्हती) १५ tests "fixture not found" म्हणून अयशस्वी झाले.
+
+raw_chain चा आकार strategy.py च्या फंक्शन्सनी प्रत्यक्ष वापरलेल्या shape शी जुळणारा:
+[{"strike_price": X, "call_options": {...}, "put_options": {...}}, ...]
+
+Premium मॉडेल साधं पण वास्तववादी — intrinsic value (ITM असेल तितकी) + अंतरानुसार कमी होणारं
+time value — जेणेकरून ITM strikes OTM पेक्षा जास्त महाग असतील (strategy.py च्या ITM-आधारित
+strike-selection ची चाचणी अर्थपूर्ण व्हावी म्हणून आवश्यक — फक्त 'सर्व strikes समान किंमत' असं
+साधेपणाने केलं असतं तर select_credit_spread_itm/select_naked_option_itm च्या net_credit/net_debit
+गणितानुसार चुकीचे (किंवा नेहमी None) निकाल आले असते).
+"""
+import pytest
+
+SPOT = 24500
+STEP = 50
+
+
+def _synthetic_premium(strike, option_type, spot=SPOT):
+    """साधं पण सुसंगत ऑप्शन प्रीमियम मॉडेल — intrinsic value + ATM पासूनच्या अंतरानुसार कमी होणारं
+    time value (किमान १०, जेणेकरून कुठलाही premium कधीच शून्य/ऋण होणार नाही)."""
+    distance = abs(strike - spot)
+    time_value = max(10.0, 100.0 - distance * 0.15)
+    if option_type == "CE":
+        intrinsic = max(0, spot - strike)
+    else:  # PE
+        intrinsic = max(0, strike - spot)
+    return round(intrinsic + time_value, 2)
+
+
+@pytest.fixture
+def sample_option_chain():
+    """SPOT (24500) भोवती ±1000 पॉइंट्स (step 50, म्हणजे 24000 ते 25000) च्या सर्व strikes साठी
+    CE/PE दोन्ही — वास्तववादी (ITM जास्त महाग) premium, आणि सर्वांसाठी एकसमान PoP=0.6
+    (option_greeks.pop) — टेस्ट फाईलमधल्याच अपेक्षेप्रमाणे ("सर्व pop=0.6 आहे")."""
+    chain = []
+    for strike in range(SPOT - 1000, SPOT + 1000 + STEP, STEP):
+        chain.append({
+            "strike_price": strike,
+            "call_options": {
+                "instrument_key": f"NSE_FO|TEST-CE-{strike}",
+                "market_data": {"ltp": _synthetic_premium(strike, "CE")},
+                "option_greeks": {"pop": 0.6},
+            },
+            "put_options": {
+                "instrument_key": f"NSE_FO|TEST-PE-{strike}",
+                "market_data": {"ltp": _synthetic_premium(strike, "PE")},
+                "option_greeks": {"pop": 0.6},
+            },
+        })
+    return chain
+
+
+@pytest.fixture(autouse=True)
+def _clear_last_good_strategy_settings():
+    """cloud_db._LAST_GOOD_STRATEGY_SETTINGS हा प्रोसेस-पातळीचा cache आहे -- एका टेस्टचं settings दुसऱ्या टेस्टमध्ये (Supabase नसताना) डीफॉल्टऐवजी
+    दिसू नये म्हणून प्रत्येक टेस्टच्या आधी/नंतर रिकामा."""
+    try:
+        import atp_private.trade_engine.cloud_db as cloud_db
+        getattr(cloud_db, "_LAST_GOOD_STRATEGY_SETTINGS", {}).clear()
+        yield
+        getattr(cloud_db, "_LAST_GOOD_STRATEGY_SETTINGS", {}).clear()
+    except ImportError:
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _mcx_live_quantity_gate_open_by_default(monkeypatch):
+    """MCX LIVE सुरक्षा-गेट (mcx_quantity_check) डीफॉल्टला उघडा — बाकीच्या MCX LIVE टेस्ट्स ना त्याची गरज नाही; गेटच्या स्वतःच्या टेस्ट्स
+    (tests/test_mcx_quantity_check.py) हे monkeypatch स्वतः उलटवतात."""
+    try:
+        import atp_private.trade_engine.trading_engine as trading_engine
+        monkeypatch.setattr(trading_engine, "is_mcx_live_quantity_verified", lambda: True)
+    except ImportError:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _isolated_mcx_candle_state(tmp_path, monkeypatch):
+    """🎓 MCX Candlestick Confirmation state (data/mcx_candle_confirm.json -- प्रतीक्षेतला भाग 2 / वापरलेले patterns) प्रत्येक टेस्टमध्ये
+    tmp मध्ये: repo/VPS वरची खरी फाईल tests वर परिणाम करू नये आणि tests ती लिहू नयेत.
+    App deps (plotly इ.) नसतील तर (उदा. फक्त elliott tests) — काही करत नाही (review F11)."""
+    try:
+        import atp_private.trade_engine.mcx_futures_trader as mcx_futures_trader
+    except ModuleNotFoundError:
+        return
+    monkeypatch.setattr(mcx_futures_trader, "CANDLE_STATE", str(tmp_path / "mcx_candle_confirm.json"))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_order_safety(monkeypatch, tmp_path):
+    """🎓 G3 order_safety: exit-अपयश मोजणी (प्रोसेस-पातळीची dict) प्रत्येक टेस्टला रिकामी, आणि settings repo/VPS च्या
+    data/engine_settings.json वरून नव्हे तर रिकाम्या dict वरून (डीफॉल्ट वर्तन) — टेस्ट्स स्वतः monkeypatch करून बदलतात.
+    App deps नसतील तर काही करत नाही (F11)."""
+    try:
+        import atp_private.trade_engine.order_safety as order_safety
+    except ModuleNotFoundError:
+        yield
+        return
+    order_safety._FAIL_COUNTS.clear()
+    monkeypatch.setattr(order_safety, "FAIL_COUNTS_PATH", str(tmp_path / "exit_fail_counts.json"))
+    order_safety._EXIT_STATE.clear()
+    monkeypatch.setattr(order_safety, "EXIT_STATE_PATH", str(tmp_path / "exit_state.json"))
+    monkeypatch.setattr(order_safety, "EXIT_LOCK_DIR", str(tmp_path / "exit_locks"))
+    monkeypatch.setattr(order_safety, "_settings", lambda: {})
+    monkeypatch.setattr(order_safety, "_sleep", lambda s: None)          # M56 S2: the bounded re-query never sleeps in tests
+    try:
+        import atp_private.trade_engine.entry_inflight as entry_inflight                                            # M56 S5: LIVE entry markers in tmp, never in the repo data/
+        monkeypatch.setattr(entry_inflight, "PATH", str(tmp_path / "entry_inflight.json"))
+    except ModuleNotFoundError:
+        pass
+    yield
+    order_safety._FAIL_COUNTS.clear()
+    order_safety._EXIT_STATE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _vision_db_isolated(tmp_path, monkeypatch):
+    """Vision V0 hook (bots) खरी data/vision.db भरू नये — नाहीतर नंतर worker / smoke ला खोटे signals दिसतील (Telegram + API खर्च)."""
+    monkeypatch.setenv("VISION_DB_PATH", str(tmp_path / "vision_test.db"))
+    monkeypatch.setenv("VISION_IMAGE_DIR", str(tmp_path / "vision_img"))
+    try:                                                                 # worker tests चे घड्याळ bar च्या मधे — bar-close wait वेगळ्या test मध्ये
+        from atp_private.trade_engine.vision import worker as _VW
+        monkeypatch.setattr(_VW, "BAR_WAIT", False)
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _paper_isolation(tmp_path, monkeypatch):
+    """Monday PAPER modules (paper/, engine_signal): tests मध्ये state फाइल्स tmp मध्ये, आणि Upstox instrument master (network) नाही ⇒
+    lot size config fallback. कुठलाही test खऱ्या network / repo data/ ला हात लावत नाही."""
+    monkeypatch.setenv("PAPER_DATA_DIR", str(tmp_path / "paper_data"))
+    monkeypatch.setenv("ENGINE_SIGNAL_DB", str(tmp_path / "engine_signals.db"))
+    monkeypatch.setenv("PAPER_JOURNAL_DB", str(tmp_path / "paper_journal.db"))
+    monkeypatch.setenv("VISION_DB_PATH", str(tmp_path / "vision_default.db"))     # vision fixtures हे स्वतःचं path पुन्हा ठेवतात
+    try:                                                                         # bot-logic tests: जुनं V0 वर्तन; approval tests ते स्वतः चालू करतात
+        from atp_private.trade_engine.vision import config as _VC
+        monkeypatch.setitem(_VC.BOT_DEFAULTS, "approval_required", False)
+    except Exception:
+        pass
+    try:
+        from atp_private.trade_engine.paper import lots as _PL
+        from atp_private.trade_engine.paper import watch as _PW
+        monkeypatch.setattr(_PL, "_default_resolve", lambda: (lambda *a, **k: (None, "tests: Upstox master नाही")))
+        monkeypatch.setattr(_PW, "_db_path", lambda: str(tmp_path / "no_live_trades.db"))   # trade_monitor tests ⇒ repo data/ चे trades नाहीत
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _level_gate_touch_by_default(monkeypatch):
+    """Level bots (Abhi: confirmation gate) — PAPER चा नवा default "confirmation" जुन्या bot-logic tests (touch वर लिहिलेले) मध्ये network
+    (Daily / 15M candles) मागवेल ⇒ tests मध्ये settings["entry_mode"] दिला नसेल तर "touch". Confirmation tests entry_mode स्पष्ट देतात किंवा
+    `LGB._entry_mode_orig` परत लावतात."""
+    try:
+        from atp_private.trade_engine.bots_common import level_gate_bot as _LGB
+        orig = getattr(_LGB, "_entry_mode_orig", _LGB.entry_mode)
+        _LGB._entry_mode_orig = orig
+        monkeypatch.setattr(_LGB, "entry_mode",
+                            lambda s: orig(s) if str((s or {}).get("entry_mode") or "").strip() else _LGB.TOUCH)
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _no_futures_volume_network(monkeypatch):
+    """Level gate (a2 / c0): tests मध्ये futures volume साठी network नाही ⇒ NA (एखादा test fetch_volume देऊन स्वतः तपासतो)."""
+    try:
+        from atp_private.trade_engine.bots_common import level_gate_bot as _LGB
+        monkeypatch.setattr(_LGB, "_default_futures_candles", lambda *a, **k: None)
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _no_live_upstox_token_check(monkeypatch):
+    """engine_signal_run ची run-सुरुवातीची token तपासणी (GET /v2/user/profile) tests मध्ये कधीच network वर नाही: default "ok" (आजचा
+    मार्ग). Token तपासणीचे tests check_fn / get स्वतः देतात."""
+    try:
+        import atp_private.trade_engine.engine_signal as engine_signal
+    except Exception:                                                    # noqa: BLE001
+        return
+    monkeypatch.setattr(engine_signal, "token_check", lambda token: "ok")
+
+
+@pytest.fixture(autouse=True)
+def _calendar_gate_open(monkeypatch):
+    """N20: the scripts' trading-day gate never depends on the day CI runs (weekend / holiday) — tests of the gate set it themselves."""
+    monkeypatch.setenv("TRADE_CALENDAR_GATE", "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_queue_now_from_engine_runs(monkeypatch):
+    """N16: engine_signal_run runs the PAPER bot's cycle right after a setup bar — never in tests (network / stores) unless a test passes
+    its own `enter_fn`."""
+    try:
+        from atp_private.trade_engine.scripts import engine_signal_run as _ESR
+    except Exception:                                                    # noqa: BLE001
+        return
+    orig = _ESR._queue_now
+    monkeypatch.setattr(_ESR, "_queue_now", lambda sym, enter_fn=None: orig(sym, enter_fn) if enter_fn else None)
+    orig_a = _ESR._area_alerts                                           # N14: no area-visit Telegram from engine-run tests
+    monkeypatch.setattr(_ESR, "_area_alerts", lambda sym, r, settings_fn=None, area_fn=None:
+                        orig_a(sym, r, settings_fn, area_fn) if area_fn else None)
+
+
+@pytest.fixture
+def elliott_leg_read(monkeypatch):
+    """Abhi 21 Oct: `daily_leg_read` default = "compare" (Daily leg nature by comparison with the neighbouring legs). Tests that encode
+    Elliott readings on crafted fixtures test the "elliott" what-if path ⇒ pinned explicitly with
+    `@pytest.mark.usefixtures("elliott_leg_read")` (their assertions unchanged)."""
+    from atp_private.trade_engine.decision3 import settings as _S3
+    monkeypatch.setitem(_S3.DEFAULTS, "daily_leg_read", "elliott")
+
+
+@pytest.fixture(autouse=True)
+def _no_gate_error_telegram(monkeypatch):
+    """DECISIONS 47 alert (bots_common.gate_alert): a bot / engine test that hits a gate error never sends a real Telegram message and
+    never writes the repo's alert state (the default sender returns False ⇒ nothing recorded). Alert tests pass `send` / `state_path`."""
+    try:
+        from atp_private.trade_engine.bots_common import gate_alert as _GA
+    except Exception:                                                    # noqa: BLE001
+        return
+    monkeypatch.setattr(_GA, "_sender", lambda: (lambda line: False))
+    _GA._SEEN.clear()
+    _GA._FAILED.clear()
+
+
+@pytest.fixture
+def earlier_break_reading(monkeypatch):
+    """BREAK-1 (owner-orders DECISIONS 60 / 69): the default is `break_hold_rule = hold`. Tests written for the earlier reading (any
+    swing beyond — the push's own extreme counted; a broken area broken back = reclaimed) run on the what-if `swing_beyond`, which
+    reproduces that reading exactly; the default is covered by tests/test_break_hold.py."""
+    from atp_private.trade_engine.decision3 import flip as FL
+    from atp_private.trade_engine.decision3 import settings as S3
+    monkeypatch.setitem(S3.DEFAULTS, "break_hold_rule", "swing_beyond")
+    monkeypatch.setattr(FL, "hold_rule", lambda s=None: "swing_beyond")   # settings dicts loaded at import time read it too
+
+
+
+@pytest.fixture
+def wick_level_bands(monkeypatch):
+    """Abhi 29 Oct: a 1H area band born from one candle follows `level_band_rule = base` (decision3/levels.area_band: a base candle ⇒
+    the wick extreme to the far body edge, an impulse candle ⇒ to its middle). Tests whose fixtures were built on the earlier band (the
+    wick to the near body edge) and whose concern is not the band run on the what-if `wick`, which reproduces it exactly; the default is
+    covered by tests/test_area_band.py and the pinned default reading."""
+    from atp_private.trade_engine.decision3 import levels as LV
+    monkeypatch.setattr(LV, "band_rule", lambda s=None: "wick")
+
+
+@pytest.fixture
+def hold_break_reading(monkeypatch):
+    """DECISIONS 76 replaced BREAK-1 (the pullback-swing hold, DECISIONS 60 / 71) by the follow-through lifecycle (default
+    `break_hold_rule = follow_through`, tests/test_lifecycle_follow_through.py). Tests written for BREAK-1 run on its what-if `hold`,
+    which reproduces it exactly; an explicit other rule still reads (and an unknown one still raises)."""
+    from atp_private.trade_engine.decision3 import flip as FL
+    from atp_private.trade_engine.decision3 import settings as S3
+    real = FL.hold_rule
+    monkeypatch.setitem(S3.DEFAULTS, "break_hold_rule", "hold")
+    monkeypatch.setattr(FL, "hold_rule", lambda s=None: real(s) if (s or {}).get("break_hold_rule") not in (None, "follow_through")
+                        else "hold")
+
+
+@pytest.fixture(scope="module")
+def earlier_break_reading_ctx():
+    """`earlier_break_reading` for module-scoped fixtures (built before any function-scoped monkeypatch): a context manager the fixture
+    builds its rows in, undone right after, so the rest of the module keeps the default. The integ51 merge put tests written on the
+    12 Oct synthetic fixture (tests/oct12_fixture.py: a support broken by new lows WITHOUT a hold ⇒ a sweep under BREAK-1, OPEN_QUESTIONS
+    A-L2) by the other branches on the what-if, as the lifecycle branch did (A-L6); their tests take `earlier_break_reading` too. The
+    default reading is pinned by tests/test_break_hold.py; before / after charts: trade-data review/gallery_fixes/integ/."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def ctx():
+        from atp_private.trade_engine.decision3 import flip as FL
+        from atp_private.trade_engine.decision3 import settings as S3
+        mp = pytest.MonkeyPatch()
+        mp.setitem(S3.DEFAULTS, "break_hold_rule", "swing_beyond")
+        mp.setattr(FL, "hold_rule", lambda s=None: "swing_beyond")
+        try:
+            yield
+        finally:
+            mp.undo()
+    return ctx
+
+
+@pytest.fixture
+def turn_base_reading(monkeypatch):
+    """DECISIONS 79 (owner rule): the default refined base is the area's ORIGIN base on 15M (`entry_area_refine_base = origin`). Tests
+    written for the replaced A7 reading (DECISIONS 63: the newest 15M turn inside the band — their synthetic bars place a later 15M
+    turn as the base) run on the what-if `newest_turn`, which reproduces that reading exactly; the default is covered by
+    tests/test_refined_origin_base.py."""
+    from atp_private.trade_engine.decision3 import settings as S3
+    monkeypatch.setitem(S3.DEFAULTS, "entry_area_refine_base", "newest_turn")
+
+
+@pytest.fixture(scope="module")
+def sw_daily_history_ctx():
+    """M50 A1: the synthetic fixture's window on a realistic Daily history (tests/sw_daily_history.py) — a context manager for
+    module-scoped fixtures, as `earlier_break_reading_ctx`."""
+    from atp_private.trade_engine.tests import sw_daily_history as H
+    return H.patched
+
+
+@pytest.fixture
+def sw_daily_history():
+    """M50 A1: the same, for one test."""
+    from atp_private.trade_engine.tests import sw_daily_history as H
+    with H.patched():
+        yield
+
+
+@pytest.fixture
+def sw_daily_history_off():
+    """M50 A1 opt-out: one test keeps the window-only Daily (its byte-identical digests were pinned on it)."""
+    from atp_private.trade_engine.tests import sw_daily_history as H
+    with H.unpatched():
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _profile_check_uncached(monkeypatch):
+    """M56 O1: the engine's profile-check cache (config.ENGINE_PROFILE_CHECK_EVERY_MIN) is off in tests (each check is real, as before);
+    the cache tests set it themselves."""
+    try:
+        import atp_private.trade_engine.config as config
+    except Exception:                                                    # noqa: BLE001
+        return
+    monkeypatch.setattr(config, "ENGINE_PROFILE_CHECK_EVERY_MIN", 0)
