@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atp-private"
+dynamic = ["version"]
+description = "ATP private package: engine / method code (private; never copied to the public ATP repository)"
+requires-python = ">=3.13"
+# No runtime dependencies on purpose: on the host the package is only put on PYTHONPATH (no pip install), so any
+# third-party library the engine needs must already be in ATP's backend image (see README, "Dependencies").
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.dynamic]
+version = { attr = "atp_private.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["atp_private*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

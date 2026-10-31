@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"   # weekly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"   # ATP's backend image (python:3.13-slim)
+      - name: Install the package
+        run: python -m pip install --upgrade pip && python -m pip install ".[test]"
+      - name: Package status
+        run: python -c "import atp_private, json; print(json.dumps(atp_private.status()))"
+      - name: Tests
+        run: python -m pytest -q -rs
