@@ -1,0 +1,142 @@
+{
+ "key_version": "batch1-v4",
+ "rule": "BREAK-2: broken = close beyond AND a reading-TF candle then closes beyond the next EXTERNAL swing: the most recent confirmed swing of the object's own TF lying beyond the object whose swing candle did NOT trade inside the object's band (swings made while testing the object are internal and never count; lower-TF swings never change the higher-TF structure). False break known at the first reading-TF close back inside. Beyond-not-broken = no flip entry. Same test for broken-back => dead; no second flip. Data-problem bars (closing-auction prints) never count.",
+ "items": [
+  {
+   "id": "L01",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "Daily support",
+    "lo": 56023.6,
+    "hi": 56169.4
+   },
+   "window": [
+    "2026-09-08",
+    "2026-09-14"
+   ],
+   "verdict": "SWEEP / retest \u2014 ALIVE (support)",
+   "known_at": "false break known at the first 15M close back inside the band (11 Sep 10:30); next Daily swing low 53,027 (3 Jun) never closed beyond",
+   "reason": "Close below the band (gap), but price never ran to the next Daily swing low (53,027) and came straight back inside. BREAK-2 \u21d2 not broken. Reader's E4(b) bear call 11 Sep 10:15 must NOT exist.",
+   "owner_check": "pending"
+  },
+  {
+   "id": "L02",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "Daily support",
+    "lo": 56023.6,
+    "hi": 56169.4
+   },
+   "window": [
+    "2026-09-14",
+    "2026-09-19"
+   ],
+   "verdict": "SWEEP / retest \u2014 ALIVE (support)",
+   "known_at": "next Daily swing low 53,027 never reached",
+   "reason": "Closes below on 15\u201316 Sep, lows 55,795 / 55,812, far from the next Daily swing low 53,027; back above on 16 Sep. \u21d2 sweep, alive.",
+   "owner_check": "pending"
+  },
+  {
+   "id": "L03",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "1H support",
+    "lo": 55699.45,
+    "hi": 55970.15
+   },
+   "window": [
+    "2026-09-22",
+    "2026-09-30"
+   ],
+   "verdict": "BROKEN only on 28 Sep (not 24 Sep) \u21d2 then FLIPPED resistance",
+   "known_at": "known 28 Sep 09:15; 24\u201327 Sep = 'beyond, not broken'",
+   "reason": "24 Sep closes below and price stays below, but the next 1H swing low (55,097.6) is closed beyond only on 28 Sep 09:15. Until then: 'beyond, not broken' \u21d2 no flip entry, so the 25 Sep E4(b) bear call = NO. From 28 Sep 09:15 broken \u21d2 flipped resistance.",
+   "owner_check": "pending"
+  },
+  {
+   "id": "L04",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "flipped resistance",
+    "lo": 55699.45,
+    "hi": 55970.15
+   },
+   "window": [
+    "2026-10-12",
+    "2026-10-19"
+   ],
+   "verdict": "SWEEP / retest \u2014 flip still ALIVE (not dead)",
+   "known_at": "next 1H swing high 56,623.8 never reached",
+   "reason": "15 Oct closes above, high 56,066, but the next 1H swing high 56,623.8 is never reached and price falls back. \u21d2 retest of the flip, not broken back \u21d2 not dead.",
+   "owner_check": "pending"
+  },
+  {
+   "id": "L05",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "1H supply",
+    "lo": 58078.9,
+    "hi": 58251.95
+   },
+   "window": [
+    "2026-07-13",
+    "2026-07-22"
+   ],
+   "verdict": "SWEEP / retest \u2014 supply ALIVE",
+   "known_at": "17 Jul 15:15 only a WICK beyond the next swing; close 58,576 below it \u21d2 no break",
+   "reason": "17 Jul closes above the band, and the last bar's wick (58,596.8) pokes past the next 1H swing high 58,581.1, but that bar CLOSES at 58,576, below the swing. Research: a wick through a swing that closes back = sweep (SFP), not a break. \u21d2 never broken; next day gap back below. Supply alive. Reader marked it BROKEN and took E4(b) 20 Jul 14:15 \u2014 wrong label (it would be a test of a live supply, not E4(b)).",
+   "owner_check": "pending"
+  },
+  {
+   "id": "L06",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "1H supply",
+    "lo": 57611.7,
+    "hi": 57799.15
+   },
+   "window": [
+    "2026-08-21",
+    "2026-09-02"
+   ],
+   "verdict": "FALSE BREAK \u2014 supply ALIVE (never broken)",
+   "known_at": "26 Aug 09:15 close above \u21d2 BEYOND_NOT_BROKEN; 26 Aug 15:15 close back inside \u21d2 false break; 27 Aug 09:30\u201309:45 closes above then back; 31 Aug 15:15 is a closing-auction data-problem bar (ignored); next EXTERNAL 1H swing high 58,076.8 (6 Aug) never closed beyond",
+   "reason": "The 24 Aug high 57,873.8 was made by a candle that traded inside this band (a test of the object) = internal swing, not counted. Next external swing = 58,076.8; never closed beyond \u21d2 never broken. Gap candles into the supply are false breaks; entries there are judged as tests of a live supply (E4(a)/E1 logic), not as broken-object retests.",
+   "owner_check": "pending"
+  },
+  {
+   "id": "L07",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "1H resistance",
+    "lo": 56474.4,
+    "hi": 56570.45
+   },
+   "window": [
+    "2026-09-17",
+    "2026-09-25"
+   ],
+   "verdict": "SWEEP \u00d73 \u2014 resistance ALIVE; ONE object (one id)",
+   "known_at": "next external 1H swing high 56,743.0 (9 Sep) never closed beyond",
+   "reason": "17 closes above across 21\u201323 Sep, highs 56,668 / 56,671 / 56,624, never near the next 1H swing high 56,996.4 \u21d2 retests/sweeps; alive. One band = one id.",
+   "owner_check": "pending"
+  },
+  {
+   "id": "L08",
+   "concept": "lifecycle",
+   "object": {
+    "tf_band": "Weekly support",
+    "lo": 54891.25,
+    "hi": 56098.7
+   },
+   "window": [
+    "2026-09-24",
+    "2026-10-19"
+   ],
+   "verdict": "SWEEP \u2014 Weekly support ALIVE (not broken)",
+   "known_at": "next Weekly swing low 52,783 never reached",
+   "reason": "Closes below on 28\u201329 Sep, low 53,786, but the next Weekly swing low 52,783 is never reached; October back inside. BREAK-2 \u21d2 not broken. Band 1,207 pt wide \u2014 a separate area-band item.",
+   "owner_check": "pending"
+  }
+ ]
+}
