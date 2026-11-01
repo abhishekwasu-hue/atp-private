@@ -1,0 +1,230 @@
+"""Q15 (Abhi FINAL) — degree-aware Daily Dow, synthetic fixtures (तारखा / किंमती code मध्ये नाहीत; फक्त रचना):
+मोठा flat (A)-(B)-(C); (C) = पाच waves खाली. Minor LH तुटला तरी DOWN; protected (2) high ⇒ (4) high फक्त (3) low खाली close नंतर;
+(5) मध्ये target जवळ maturity; origin close-break + उलट impulse ⇒ flip; फक्त close-break ⇒ DOWN (origin_broken)."""
+import pytest
+
+from atp_private.trade_engine.decision3 import daily as DD
+from atp_private.trade_engine.tests.test_decision3 import daily_from_path
+
+S = {"daily_min_sessions": 3, "daily_sigma_sessions": 3, "range_eq_sigma_d": 0.25}
+
+# ABC_FIX rule 1: या fixtures मधली counter-move 3-wave आहे आणि trend सुरुवात टिकते ⇒ default (parent gate on) मध्ये ती correction.
+# origin_broken / Q23 / Q27 / Q36 यंत्रणा (rule 1 सोडतो तेव्हा — counter impulse किंवा trend सुरुवात तुटली) gate off ने तपासली (Q53).
+OB = {**S, "daily_parent_gate": False}
+#      pre  (A) (B) (1) (2)  ---------- (3) with minor swings ---------  (4)  ----- (5) -----
+FLAT = [100, 60, 98, 85, 93, 82, 84.5, 84, 74, 76, 75.5, 62, 80, 70, 72, 58]   # minor bounces नंतर थांबा ⇒ confirm होतात
+
+
+def _append_days(d, closes):
+    """एक-दिवसाचे bars जोडा (जलद हालचाल — pivot confirm होण्याआधीच पुढचा टोक)."""
+    import pandas as pd
+    rows, prev, day = [], float(d["close"].iloc[-1]), d["timestamp"].iloc[-1]
+    for c in closes:
+        day = day + pd.offsets.BDay(1)
+        rows.append({"timestamp": day, "open": prev, "high": max(prev, c) + 0.5, "low": min(prev, c) - 0.5, "close": float(c),
+                     "bar_end": day + pd.Timedelta(hours=15, minutes=30)})
+        prev = c
+    return pd.concat([d, pd.DataFrame(rows)], ignore_index=True)
+
+
+def _idx_first(st, cond):
+    return next(i for i, x in enumerate(st) if cond(x))
+
+
+@pytest.mark.usefixtures("elliott_leg_read")   # Abhi 21 Oct: Elliott what-if path (daily_leg_read = compare default)
+def test_flat_c_five_waves_down_degree_aware():
+    d = daily_from_path(FLAT)
+    st = DD.fold(d, S)
+    C = d["close"].to_numpy()
+    b3 = _idx_first(st, lambda x: x.trend == "DOWN")
+    assert C[b3] < 84.5 and st[b3].wave == "L3" and abs(st[b3].protected.price - 93.5) < 1e-9     # (2) high = origin
+    low3 = 61.5
+    adv = _idx_first(st, lambda x: x.protected is not None and abs(x.protected.price - 93.5) > 1e-9)
+    assert all(x.trend == "DOWN" for x in st[b3:])                                             # (3), (4), (5) संपूर्ण DOWN
+    assert C[adv] < low3 and all(C[j] >= low3 for j in range(b3, adv))                         # पहिल्या (3)-low-खालच्या close ला
+    assert all(abs(x.protected.price - 93.5) < 1e-9 for x in st[b3:adv])                         # minor LH तुटले तरी (2) high
+    assert abs(st[adv].protected.price - 80.5) < 1e-9 and st[adv].wave == "L5"                 # (4) high, फक्त (3) low खाली close नंतर
+    corr = [x for x in st[b3:adv] if x.phase == "correction"]
+    assert corr and all(x.wave == "L4" and x.corr_label for x in corr)                         # (4) = correction चालू (label सह)
+    minor_lh = 76.5                                                                             # (3) आतला minor LH
+    above = [j for j in range(b3, adv) if C[j] > minor_lh]
+    assert above and all(st[j].trend == "DOWN" for j in above)                                 # minor LH वर close ⇒ trend बदलत नाही
+    # Q44 (Abhi): target = parent origin नंतरच्या पहिल्या impulse leg चं टोक (पहिली trend-degree correction सुरू होताना); अशी
+    # correction नसलेल्या या fixture ला structural target नाही ⇒ target नाही, mature नाही ((A) low fallback काढला).
+    assert not any(x.mature for x in st) and st[-1].targets == ()
+
+
+def test_minor_daily_mode_flips_on_minor_lh_but_impulse_mode_does_not():
+    d = daily_from_path(FLAT)
+    old = DD.fold(d, {**S, "daily_trend_mode": "minor"})
+    new = DD.fold(d, S)
+    k = len(FLAT) and _idx_first(new, lambda x: x.trend == "DOWN")
+    assert any(x.trend != "DOWN" for x in old[k:]) and all(x.trend == "DOWN" for x in new[k:])   # degree error दूर
+
+
+def test_origin_close_break_alone_keeps_down_then_opposite_impulse_flips_up():
+    path = FLAT[:12] + [96, 88, 104]                                                          # (3) नंतर origin (93.5) वर, HL, नवा HH
+    d = daily_from_path(path)
+    st = DD.fold(d, OB)
+    C = d["close"].to_numpy()
+    brk = _idx_first(st, lambda x: x.phase == "origin_broken")
+    assert C[brk] > 93.5 and st[brk].trend == "DOWN"                                           # फक्त close-break ⇒ trend संपत नाही
+    up = _idx_first(st, lambda x: x.trend == "UP")
+    assert up > brk and st[up].protected.kind == "L" and abs(st[up].protected.price - 87.5) < 1e-9   # origin = नवा HL
+    assert C[up] > 96.5 and st[up].wave == "L3"
+
+
+def test_new_low_after_origin_break_resumes_down_with_advanced_protected():
+    path = FLAT[:12] + [95, 70, 55]                                                           # origin वर close, मग (3) low खाली
+    d = daily_from_path(path)
+    st = DD.fold(d, OB)
+    brk = _idx_first(st, lambda x: x.phase == "origin_broken")
+    after = [x for x in st[brk:] if x.phase == "impulse"]
+    assert after and after[-1].trend == "DOWN" and abs(after[-1].protected.price - 95.5) < 1e-9
+
+
+def test_impulse_fold_truncation_invariant():
+    d = daily_from_path(FLAT + [66, 50])
+    full = DD.fold(d, S)
+    key = lambda x: (x.trend, getattr(x.protected, "price", None), x.phase, x.wave, x.mature)   # noqa: E731
+    for k in range(5, len(d)):
+        part = DD.fold(d.iloc[:k], S)
+        assert [key(x) for x in part] == [key(x) for x in full[:k]], k
+
+
+def test_cap_helpers():
+    from atp_private.trade_engine.decision3 import method as M
+    assert M.cap_min(None, "B") == "B" and M.cap_min("B", "weak") == "weak" and M.cap_min("weak", None) == "weak"
+    assert M.cap_conv("A", "B") == "B" and M.cap_conv("A", "weak") == "weak" and M.cap_conv("against", "B") == "against"
+    assert M.cap_conv("B", None) == "B"
+
+
+def _V_with(daily_states, weekly_states, s=None):
+    import pandas as pd
+    from atp_private.trade_engine.decision3 import engine as E3
+    from atp_private.trade_engine.decision3 import settings as S3
+    V = E3.V22.__new__(E3.V22)
+    V.s = S3.load(s)
+    V.daily, V.weekly = daily_states, weekly_states
+    V.bar_end = pd.Series([daily_states[-1].known_at + pd.Timedelta(days=1)])
+    return V
+
+
+def test_step1_weekly_against_caps_b_and_mature_or_origin_broken_caps_weak():
+    pin = {"daily_side_rule": "impulse"}   # SW (DECISIONS 109): pinned — this test is about the weekly cap and the mature / origin-broken caps, not the Daily side; asserts unchanged
+    from atp_private.trade_engine.decision3 import engine as E3
+    d = daily_from_path(FLAT)
+    st = DD.fold(d, S)
+    wk_up = [DD.DState(0, st[0].day, st[0].known_at, "UP")]
+    V = _V_with(st[:22], wk_up, s=pin)                                                                # (3) impulse चालू, weekly UP
+    ok, why, s1, ctx = V.step1(0)
+    assert ok and ctx["trend"] == "DOWN" and ctx["cap"] == "B" and ctx["resolution"] == "daily impulse"
+    from atp_private.trade_engine.tests.test_decision3_daily_review import HEAD, WAVE4, WAVE5, _fold   # Q44: structural target असलेला fixture ((4) A1)
+    _, sm = _fold(HEAD + WAVE4 + WAVE5)
+    V = _V_with(sm, [DD.DState(0, sm[0].day, sm[0].known_at, "UNKNOWN")], s=pin)                        # (5) mature
+    V.s["wave_gates"] = True                                                                    # जुना नियम (Abhi 12 Oct) pin — B1 ने बदलला
+    ok, why, s1, ctx = V.step1(0)
+    # Abhi (12 Oct): रचना अखंड (impulse, उलट impulse नाही) ⇒ mature = पुरावा फक्त ⇒ cap नाही, grade एक पायरी खाली (step_down)
+    assert s1.mature and E3.mature_intact(s1) and ctx["cap"] is None and ctx.get("step_down") and "mature" in " ".join(ctx["notes"])
+    V.s["wave_gates"] = False                                                                   # Abhi B1 (default): context only
+    ok, why, s1, ctx = V.step1(0)
+    assert s1.mature and ctx["cap"] is None and not ctx.get("step_down") and ctx["wave_context"]["mature"]
+    assert any("context only" in x or "context:" in x for x in ctx["notes"])
+    path = FLAT[:12] + [96]
+    sb = DD.fold(daily_from_path(path), OB)
+    V = _V_with(sb, [DD.DState(0, sb[0].day, sb[0].known_at, "UNKNOWN")], s=pin)
+    ok, why, s1, ctx = V.step1(0)
+    assert s1.phase == "origin_broken" and ctx["trend"] == "DOWN" and ctx["cap"] == "B" and ctx["notes"]    # Q23 (Abhi): कमाल B
+    assert any("कमाल B" in x for x in ctx["notes"])                                             # cap ची नोंद ⇒ "गहाळ" यादीत येते
+
+
+def test_step1_weekly_fallback_when_daily_unreadable():
+    pin = {"daily_side_rule": "impulse"}   # SW (DECISIONS 109): pinned — this test is about the weekly fallback when the Daily is unreadable, not the Daily side; asserts unchanged
+    d = daily_from_path([100, 101, 100.5, 101.2])
+    st = DD.fold(d, S)
+    V = _V_with(st, [DD.DState(0, st[0].day, st[0].known_at, "DOWN")], s=pin)
+    ok, why, s1, ctx = V.step1(0)
+    assert s1.trend in ("NEUTRAL", "UNKNOWN") and ok and ctx["trend"] == "DOWN" and ctx["resolution"] == "weekly fallback" \
+        and ctx["cap"] == "B"
+
+
+def test_weekly_from_daily_known_at_is_last_day():
+    d = daily_from_path(FLAT)
+    w = DD.weekly_from_daily(d)
+    assert len(w) < len(d) and (w["bar_end"].diff().dropna() > __import__("pandas").Timedelta(0)).all()
+    assert w["bar_end"].iloc[0] == d["bar_end"].iloc[(d["timestamp"].dt.to_period("W-FRI") == d["timestamp"].dt.to_period("W-FRI").iloc[0]).sum() - 1]
+
+
+# (B) सरळ नाही: आतले swings (60 ⇒ 75 ⇒ 68 ⇒ 98). (A) low = 60 राहतो; (B) आतला low (68) maturity target नाही. flip नंतर origin =
+# सर्वात उंच LH ((2) high) — सर्वात खालचा नाही (review fixture ने पकडलेला क्रम-bug).
+FLAT_B_INNER = FLAT[:2] + [75, 68] + FLAT[2:]
+
+
+@pytest.mark.usefixtures("elliott_leg_read")   # Abhi 21 Oct: Elliott what-if path (daily_leg_read = compare default)
+def test_b_with_inner_swings_same_behaviour_and_no_target_without_a1_correction():
+    # Abhi 21 Oct (daily_range_rule = structure): this fixture's (B) inner swings fail on both sides inside (A)–(B) ⇒ a structural RANGE
+    # before the DOWN flip; the Q15 / Q28 / Q44 mechanics this test pins are read under the c13 range what-if (expectations unchanged).
+    d = daily_from_path(FLAT_B_INNER)
+    st = DD.fold(d, {**OB, "daily_range_rule": "c13"})
+    b3 = _idx_first(st, lambda x: x.trend == "DOWN")
+    assert st[b3 - 1].trend == "UP"                    # Q28: data (A) पासून ⇒ (B) zigzag = UP impulse; (B) चा HL close ने तुटेपर्यंत UP
+    assert all(x.trend == "DOWN" for x in st[b3:]) and abs(st[b3].protected.price - 93.5) < 1e-9   # flip ⇒ सर्वात उंच LH = (2) high
+    assert abs(st[-1].protected.price - 80.5) < 1e-9 and st[-1].wave == "L5"
+    # Q44 (Abhi): target = parent origin नंतरच्या पहिल्या impulse leg चं टोक (पहिली trend-degree correction सुरू होताना); अशी
+    # correction नसलेल्या या fixture ला structural target नाही ⇒ target नाही, mature नाही ((A) low fallback काढला).
+    assert not st[-1].mature and st[-1].targets == ()
+
+
+@pytest.mark.parametrize("prefix", [[120, 105, 112], [90, 110], [100, 95, 100], [60, 80, 70]])
+def test_start_offset_invariance(prefix):
+    """History कुठून सुरू होते त्यावर (C) ची degree / protected / wave अवलंबून नाही."""
+    key = lambda x: (x.trend, getattr(x.protected, "price", None), x.phase, x.wave, x.mature)   # noqa: E731
+    base = DD.fold(daily_from_path(FLAT), S)
+    tail = DD.fold(daily_from_path(prefix + FLAT), S)[-len(base):]
+    b3 = _idx_first(base, lambda x: x.trend == "DOWN")
+    assert [key(x) for x in tail[b3:]] == [key(x) for x in base[b3:]]
+
+
+def test_origin_break_with_existing_opposite_structure_flips_on_break_day():
+    """(4) मध्येच HL + HH तयार, मग origin वर close ⇒ त्याच दिवशी UP; origin = तो HL (break नंतरच्या minor swing ची वाट नाही)."""
+    d = daily_from_path(FLAT[:12] + [80, 72, 100, 104])
+    st = DD.fold(d, S)
+    C = d["close"].to_numpy()
+    up = _idx_first(st, lambda x: x.trend == "UP")
+    b3 = _idx_first(st, lambda x: x.trend == "DOWN")
+    assert C[up] > 93.5 and all(C[j] <= 93.5 for j in range(b3, up))            # DOWN नंतरचा पहिलाच origin-वरचा close
+    assert st[up].protected.kind == "L" and abs(st[up].protected.price - 71.5) < 1e-9 and st[up].wave == "L3"
+
+
+def test_correction_top_confirmed_after_fast_new_low_still_advances_protected():
+    """(4) टोक N bars नंतर confirm होतो; त्याआधीच (3) low खाली close झाला तरी correction हरवत नाही ⇒ protected = (4) high, wave (5)."""
+    d = _append_days(daily_from_path(FLAT[:12]), [66, 72, 80, 60, 58, 57, 56])
+    st = DD.fold(d, S)
+    assert st[-1].trend == "DOWN" and st[-1].wave == "L5" and abs(st[-1].protected.price - 80.5) < 1e-9
+
+
+def test_flip_origin_skips_hl_broken_later():
+    """origin तुटल्यावर (अ) flip: नंतर किंमत ज्या HL खाली गेली तो origin होऊ शकत नाही."""
+    d = _append_days(daily_from_path(FLAT[:12]), [68, 74, 80, 77, 73, 70, 77, 85, 92, 83, 75, 66, 75, 85, 94, 96])
+    j = int(d["close"].to_numpy().tolist().index(92.0))
+    d.loc[j, "high"] = 97.5                                                       # wick high (close origin खालीच)
+    st = DD.fold(d, OB)
+    C = d["close"].to_numpy()
+    brk = _idx_first(st, lambda x: x.phase == "origin_broken" or x.trend == "UP")
+    assert C[brk] > 93.5
+    assert all(not (x.trend == "UP" and abs(x.protected.price - 69.5) < 1e-9) for x in st)   # 69.5 HL नंतर 65.5 आला ⇒ origin नाही
+
+
+def test_post_break_hl_must_be_inside_old_impulse_end():
+    """(आ) break नंतरचा "HL" जुन्या impulse टोकाइतका / पलीकडे असेल तर तो HL नाही (double bottom) ⇒ flip नाही."""
+    st = DD.fold(daily_from_path(FLAT[:12] + [96, 62, 99]), S)
+    assert all(not (x.trend == "UP" and abs(x.protected.price - 61.5) < 1e-9) for x in st)
+
+
+def test_abc_fix_three_wave_counter_move_holding_the_trend_start_is_a_correction():
+    """ABC_FIX rule 1 (default gate on): वरच्या fixture ची (3) नंतरची 3-wave counter-move origin close ने तोडते, पण trend ची सुरुवात
+    टिकते ⇒ origin_broken / flip नाही — same-degree correction (protected = parent)."""
+    st = DD.fold(daily_from_path(FLAT[:12] + [96, 88]), S)
+    after = st[next(i for i, x in enumerate(st) if x.trend == "DOWN"):]
+    assert all(x.trend == "DOWN" for x in after)
+    assert not any(x.phase == "origin_broken" for x in after) and any(x.counter == "correction" for x in after)

@@ -1,0 +1,1721 @@
+"""engine3_live.py — decision3 (थर v2.2, method engine: trend → area → pullback → commitment + c1; R:R नाही — Abhi 13 Oct) चा **live** feed (Abhi: one bot, Tuesday PAPER).
+
+प्रत्येक बंद 15M candle नंतर (cron, `scripts/engine_signal_run.py --engine decision3`) एका symbol साठी:
+  • 15M spot (Upstox, `engine3_m15_days` दिवस) — फक्त बंद candles; NIFTY ⇒ `data_policy.filter_allowed(..., "annotation")` (holdout row नाही).
+  • Daily (Upstox 'day', ~10 वर्षं, आजचा अपूर्ण Daily bar नाही) — Q33: Daily holdout candles फक्त warm-up input (level_reaction.daily_trend
+    प्रमाणेच); output मध्ये sealed तारीख नाही (`history.sealed_fn`). Weekly = Daily वरून (V22 स्वतः).
+  • 5M spot (LTF: c1 5M CHoCH) ⇒ V22 `ltf=`; नसेल ⇒ fail-closed. Front-month FUT 5M volume (c0 dominant candle + volume) ⇒ V22
+    `futures=` (expiry सह; जुना V22 ⇒ m15 joined `volume`; `engine3_fut_days` — raw FUT bars, method §3). Abhi Z-1c:
+    NIFTY / BANKNIFTY चा FUT नसेल ⇒ FutVolumeMissing (data error: entry नाही + दिवसातून एकदा Telegram); volume शिवाय grade-B entry नाही.
+  • V22(m15, daily_df=…).decide(शेवटचा बंद bar) ⇒ engine_signal store row (decision2 च्याच columns) ⇒ bots चा adapter (`pending_entry`).
+Fail-closed: data नाही / अपूर्ण / exception ⇒ EngineDataError (caller "error" row + दिवसातून एकदा Telegram ओळ). Order / broker call नाही.
+Daily fold (सर्वात महाग भाग, ~50 s) दिवसाला एकदा: input hash वर disk cache (`data/engine3_cache/`) — शुद्ध function, निकाल तोच.
+1m spot (Abhi Z-1o = (a), setting `engine3_use_1m`, default True): swings2 ला प्रत्येक 15M candle मधला high / low क्रम (replay / rsi2 सारखाच)
+⇒ V22 `df1m=` (swings2 ⇒ levels + rsi2 Divergence त्याच pivots वर). आधीचे दिवस historical (दिवसातून एकदा, disk cache), आजचे intraday
+(प्रत्येक cycle ला 1 call). फक्त बंद 1m आणि शेवटच्या बंद 15M च्या आतले (look-ahead नाही). 1m नाही ⇒ जुना मार्ग (1m शिवाय) + कारण
+(payload `m1`, log ओळ) — data error / block नाही (FUT volume हा आवश्यक input, 1m नाही). False ⇒ जुनं वर्तन.
+M56 O1 (D3, setting `engine3_history_cache`, default True): the prior-day history of every TF (15M / 5M / Daily / FUT) and the FUT resolve
+are fetched once a day (disk cache, shared by the resident's per-close runs and retries); each cycle then asks only the intraday (newest
+bars). Same candles ⇒ byte-identical decision inputs (tests/test_m56_feed_cache.py). GETS = this process's Upstox GET count (log line).
+"""
+import datetime as dt
+import hashlib
+import inspect
+import json
+import math
+import os
+import pickle
+import urllib.parse
+
+import numpy as np
+import pandas as pd
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULTS = {"engine3_m15_days": 90, "engine3_daily_days": 3650, "engine3_ltf_days": 10,
+            "engine3_fut_days": 45,                                       # FUT history window (raw bars, method §3; the legacy slot baseline needed ≥ 21 sessions)
+            "engine3_use_1m": True,                                       # Abhi Z-1o (a): 1m spot ⇒ swings2 (1m चा window = engine3_m15_days)
+            "engine3_cache_keep_days": 3,                                 # data/engine3_cache: इतक्या दिवसांपेक्षा जुन्या files (mtime) run सुरू होताना काढतो
+            "engine3_bar_grace_min": 2,                                   # M53 MS-1: a closed bar is "late" only after its close + this grace (minutes)
+            "engine3_history_cache": True,                                # M56 O1 (D3): prior-day history (15M / 5M / Daily / FUT) + FUT resolve once a day; each cycle = intraday only
+            "engine3_bar_final_grace_s": 3,                               # M56 E3 (A3): a trigger bar is accepted only this many seconds
+                                                                          # after its close (Upstox's bar = final by then; provisional)
+            "engine3_h1_history_days": 1825,                              # M56 E1 (DECISIONS 98): the stored 15M history the 1H swings read
+                                                                          # (before the 15M window); as far back as Upstox serves, up to this
+            "engine3_store_chunks_per_cycle": 3}                          # M56 E1 review: backfill GETs per live cycle (the pre-open fills all)
+FUT_REQUIRED = ("NIFTY", "BANKNIFTY")                                     # Abhi Z-1c: FUT volume नाही = data error (entry नाही + Telegram)
+DATA_PROBLEM_FUT = "data problem: FUT volume missing"
+SESSION_OPEN, SESSION_CLOSE = (9, 15), (15, 30)
+FUT_EXCHANGE = {"SENSEX": "BSE"}                                          # बाकी NSE (NIFTY / BANKNIFTY)
+
+
+class EngineDataError(RuntimeError):
+    """Live data नाही / अपूर्ण ⇒ entry नाही (fail-closed)."""
+
+
+class FutVolumeMissing(EngineDataError):
+    """Abhi Z-1c: NIFTY / BANKNIFTY चा FUT volume नाही ⇒ data error ⇒ entry नाही; caller दिवसातून एकदा (symbol प्रमाणे) Telegram ओळ
+    "data problem: FUT volume missing" (engine_signal.alert_data_problem)."""
+    data_problem = True
+
+
+class BarLate(EngineDataError):
+    """DECISIONS 37 (trigger_tf 5M): the 5M bar (spot / FUT) of the 5M close being decided is not at Upstox yet ⇒ this cycle fails closed
+    (error row); the next minute's cycle decides it (catch-up). one_bar = only that one close is missing (the bar before it is there) ⇒
+    the caller retries silently (no Telegram); more missing ⇒ the usual error line."""
+    bar_late = True
+
+    def __init__(self, msg, one_bar=False):
+        super().__init__(msg)
+        self.one_bar = bool(one_bar)
+
+
+class FutBarLate(BarLate):
+    """DECISIONS 37 (trigger_tf 5M): the FUT 5M bar of the 5M close being decided is not at Upstox yet ⇒ this cycle fails closed (error
+    row); the next minute's cycle decides it (catch-up). Not the Z-1c "FUT volume missing" data problem."""
+
+
+class TokenRejected(EngineDataError):
+    """Upstox ने token नाकारला (HTTP 401 / 403, उदा. UDAPI100050 "Invalid token used to access API" — दुसऱ्या system साठी नवा token
+    काढला की bot चा token रद्द होतो) ⇒ bot आंधळा. EngineDataError च ⇒ आजचे सर्व fail-closed मार्ग तसेच; caller (engine_signal_run)
+    वेगळी Telegram ओळ (दर 15M bar). Message मध्ये token कधीच नाही."""
+    token_rejected = True
+
+
+TOKEN_REJECTED_CODES = ("UDAPI100050",)                                   # Upstox: "Invalid token used to access API"
+
+
+def _upstox_code(body=None, error=None):
+    """Upstox errorCode (UDAPI…) body / error text मधून; नाही ⇒ ""."""
+    import re
+    try:
+        text = json.dumps(body, default=str) if body is not None else ""
+    except (TypeError, ValueError):
+        text = ""
+    m = re.search(r"UDAPI\d+", f"{text} {error or ''}")
+    return m.group(0) if m else ""
+
+
+def token_rejected(status, body=None, error=None):
+    """एकच detector: Upstox ने token नाकारला का? HTTP 401 / 403 (authenticated endpoint) किंवा body / error मध्ये UDAPI100050 /
+    "Invalid token". 200 / network error (status None) ⇒ False (network चूक = token नाकारला नाही)."""
+    if status is None or status == 200:
+        return False
+    if status in (401, 403):
+        return True
+    text = f"{_upstox_code(body, error)} {error or ''}".lower()
+    return any(c.lower() in text for c in TOKEN_REJECTED_CODES) or "invalid token" in text
+
+
+def raise_if_token_rejected(what, status, body=None, error=None):
+    """token_rejected ⇒ TokenRejected (फक्त HTTP status + Upstox code, token नाही). नाहीतर काही नाही (आजचा मार्ग तसाच)."""
+    if token_rejected(status, body, error):
+        code = _upstox_code(body, error)
+        raise TokenRejected(f"{what}: Upstox token rejected (HTTP {status}{' ' + code if code else ''})")
+
+
+PROFILE_PATH = "/user/profile"                                            # = scripts/paper_status.PROFILE_URL (test तपासतो)
+PROFILE_TIMEOUT = (5, 5)                                                  # (connect, read) सेकंद — run सुरुवातीची तपासणी लहानच
+
+
+def profile_url():
+    """GET /v2/user/profile — verify_opportunity_data_availability.BASE_V2 वरून (scripts/ import नाही ⇒ VPS वर ImportError नाही)."""
+    import atp_private.trade_engine.verify_opportunity_data_availability as V
+    return f"{V.BASE_V2}{PROFILE_PATH}"
+
+
+def profile_check(token, get=None):
+    """Run सुरुवातीची एकच स्वस्त authenticated तपासणी: GET /v2/user/profile (paper_status सारखाच URL), retry नाही, timeout (5, 5).
+    रिटर्न "ok" / "rejected (HTTP 401 UDAPI100050)" / "unknown (…)" (network / इतर status ⇒ unknown = आजचा मार्ग). कधीच raise नाही;
+    token कधीच output मध्ये नाही. M56 O1 (D3): the real check (get None) is made once per config.ENGINE_PROFILE_CHECK_EVERY_MIN per
+    token (disk, keyed by a token hash — never the token); only "ok" is cached (rejected / unknown ⇒ checked again every run, as before). A token rejected in between still fails every data GET
+    (raise_if_token_rejected), so the cache never hides a dead token from the decision."""
+    if get is None:
+        hit = _profile_cached(token)
+        if hit is not None:
+            return hit
+    try:
+        real = get is None
+        if get is None:
+            import atp_private.trade_engine.verify_opportunity_data_availability as V
+            get = lambda url, tok: V._get(url, tok, timeout=PROFILE_TIMEOUT, retries=0)  # noqa: E731
+        _count_get()
+        status, body, error = get(profile_url(), token)
+    except Exception as exc:                                             # noqa: BLE001
+        return f"unknown ({type(exc).__name__})"
+    if status == 200:
+        res = "ok"
+    elif token_rejected(status, body, error):
+        code = _upstox_code(body, error)
+        res = f"rejected (HTTP {status}{' ' + code if code else ''})"
+    else:
+        return f"unknown (HTTP {status})" if status is not None else "unknown (network)"
+    if real and res == "ok":
+        _profile_store(token, res)
+    return res
+
+
+def _profile_path():
+    return os.path.join(cache_dir(), "profile_check.json")
+
+
+def _token_hash(token):
+    return hashlib.sha256(str(token).encode()).hexdigest()[:16]
+
+
+def profile_every_min():
+    try:
+        import atp_private.trade_engine.config as config
+        return max(0.0, float(getattr(config, "ENGINE_PROFILE_CHECK_EVERY_MIN", 0)))
+    except Exception:                                                    # noqa: BLE001
+        return 0.0
+
+
+def _profile_cached(token, now=None):
+    """"ok" if this token's last real profile check passed less than ENGINE_PROFILE_CHECK_EVERY_MIN ago (0 ⇒ always check); else None."""
+    every = profile_every_min()
+    if every <= 0:
+        return None
+    try:
+        with open(_profile_path()) as f:
+            d = json.load(f)
+        age = (now or dt.datetime.now(dt.timezone.utc)).timestamp() - float(d["at"])
+        res = str(d.get("result") or "")
+        if d.get("token") == _token_hash(token) and 0 <= age < every * 60 and res == "ok":
+            return res
+    except Exception:                                                    # noqa: BLE001 — no / bad cache ⇒ check
+        pass
+    return None
+
+
+def _profile_store(token, result, now=None):
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        tmp = f"{_profile_path()}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"token": _token_hash(token), "at": (now or dt.datetime.now(dt.timezone.utc)).timestamp(), "result": result}, f)
+        os.replace(tmp, _profile_path())
+    except Exception:                                                    # noqa: BLE001
+        pass
+
+
+def history_cache_on(s=None):
+    """Setting `engine3_history_cache` (default True). "false" / "0" / "no" / "off" ⇒ False (the uncached path: every TF's history each cycle)."""
+    v = (s or {}).get("engine3_history_cache")
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return DEFAULTS["engine3_history_cache"]
+    return v.strip().lower() not in ("false", "0", "no", "off") if isinstance(v, str) else bool(v)
+
+
+def cache_dir():
+    return os.environ.get("ENGINE3_CACHE_DIR") or os.path.join(ROOT, "data", "engine3_cache")
+
+
+# ------------------------------------------------------------------------------------------------ instrument
+def index_key(symbol):
+    """instruments.py (एकच नोंद) ⇒ Upstox index key. माहीत नाही ⇒ EngineDataError (upstox_api चा NIFTY fallback कधीच नाही)."""
+    import atp_private.trade_engine.instruments as INS
+    try:
+        return INS.get(symbol)["key"]
+    except ValueError as exc:
+        raise EngineDataError(f"{symbol}: instrument resolve नाही (instruments.py) — {exc}")
+
+
+GETS = {"n": 0}                                                           # M56 O1 (D3): Upstox GETs made by this process (log + tests)
+
+
+def _count_get(n=1):
+    GETS["n"] += int(n)
+
+
+def resolve_future(token, symbol, today):
+    """Front-month index future (NSE: NIFTY / BANKNIFTY; BSE: SENSEX). रिटर्न info dict; नाही ⇒ EngineDataError."""
+    import atp_private.trade_engine.verify_opportunity_data_availability as V
+    exch = FUT_EXCHANGE.get(symbol.upper(), "NSE")
+    params = {"query": symbol.upper(), "exchanges": exch, "segments": "FO", "instrument_types": "FUT", "page_number": 1, "records": 30}
+    _count_get()
+    status, body, error = V._get(f"{V.BASE_V2}/instruments/search", token, params=params)
+    raise_if_token_rejected(f"{symbol}: FUT resolve", status, body, error)
+    if status != 200:
+        raise EngineDataError(f"{symbol}: FUT resolve HTTP {status} ({str(error)[:80]})")
+    rows = [r for r in ((body or {}).get("data") or []) if V._name_before_fut(r.get("trading_symbol")) == symbol.upper()
+            and V._expiry_str(r.get("expiry")) >= today.isoformat()]
+    if not rows:
+        raise EngineDataError(f"{symbol}: {exch} front-month FUT सापडला नाही ⇒ FUT volume नाही")
+    rows.sort(key=lambda r: V._expiry_str(r.get("expiry")))
+    r = rows[0]
+    return {"trading_symbol": r.get("trading_symbol"), "instrument_key": r.get("instrument_key"), "expiry": V._expiry_str(r.get("expiry"))}
+
+
+# ------------------------------------------------------------------------------------------------ Upstox feed (VPS)
+class UpstoxFeed:
+    """फक्त GET. historical (chunks) + आजचा intraday. कोणताही chunk अयशस्वी ⇒ EngineDataError (अपूर्ण history वर निर्णय नाही)."""
+    CHUNK = {"1minute": 28, "5minute": 28, "15minute": 28, "day": 3700}
+
+    def __init__(self, token, today=None, cache=False):
+        if not token:
+            raise EngineDataError("Upstox token नाही")
+        self.token = token
+        if today is None:                                                # M56 O3 (D5): IST date, never the server's local date
+            from atp_private.trade_engine.config import get_ist_today
+            today = get_ist_today()
+        self.today = today
+        self.last_session = None                                         # 15M history मधला शेवटचा (आजच्या आधीचा) session दिवस
+        self.cache = bool(cache)                                         # M56 O1 (D3): prior-day history of every TF once a day (disk) + FUT resolve once a day
+
+    def _series(self, key, interval, days, contract=None):
+        out = self._history_cached(key, interval, days) if self.cache else self._history(key, interval, days)
+        if interval == "15minute":                                       # 1m history cache ची "पूर्ण" खूण (सुट्टी ⇒ तोच शेवटचा दिवस)
+            self.last_session = _last_date(out, self.today) or self.last_session
+        if interval != "day":
+            out = out + self._intraday(key, interval)
+        return candles_df(out, contract)
+
+    def _history(self, key, interval, days):
+        """historical chunks (+ गायब दिवस) — candles list. minute ⇒ काल पर्यंत; day ⇒ आज पर्यंत."""
+        import atp_private.trade_engine.verify_opportunity_data_availability as V
+        # minute history: to_date = काल (आजचे bars intraday मधून). to_date = आज दिल्यास Upstox कालचा पूर्ण दिवस वगळतो (13 Oct: 15M/5M
+        # 9 Oct ला संपले, 12 Oct गायब; फक्त 12 Oct मागितल्यावर पूर्ण दिवस आला).
+        out = []
+        to = self.today if interval == "day" else self.today - dt.timedelta(days=1)
+        start = self.today - dt.timedelta(days=int(days))
+        while to > start:
+            frm = max(start, to - dt.timedelta(days=self.CHUNK[interval]))
+            _count_get()
+            r = V.fetch_candles_window(self.token, key, interval, frm, to)
+            raise_if_token_rejected(f"{key} {interval} history", r["status"], None, r["error"])
+            if r["status"] != 200:
+                raise EngineDataError(f"{key} {interval} history HTTP {r['status']} ({str(r['error'])[:80]})")
+            out.extend(r["candles"])
+            to = frm - dt.timedelta(days=1)
+        if interval != "day":
+            out.extend(self._fill_recent_days(key, interval, out))
+        return out
+
+    def _intraday(self, key, interval):
+        import atp_private.trade_engine.verify_opportunity_data_availability as V
+        unit, val = V._V3_UNITS[interval]
+        enc = urllib.parse.quote(key, safe="")
+        _count_get()
+        st, body, err = V._get(f"{V.BASE_V3}/intraday/{enc}/{unit}/{val}", self.token)
+        raise_if_token_rejected(f"{key} {interval} intraday", st, body, err)
+        if st != 200:
+            raise EngineDataError(f"{key} {interval} intraday HTTP {st} ({str(err)[:80]})")
+        return list(((body or {}).get("data") or {}).get("candles") or [])
+
+    def expected_last_session(self):
+        """History मध्ये असायलाच हवा तो शेवटचा दिवस: 15M history चा शेवटचा session (सुट्टी असेल तर तो आपोआप आधीचा दिवस); 15M अजून
+        मागवला नसेल ⇒ कालचा weekday (जुना नियम)."""
+        if self.last_session is not None:
+            return self.last_session
+        prev = self.today - dt.timedelta(days=1)
+        hol = _holidays()                                                # M56 O1: the NSE list too ⇒ after a holiday the 15M cache still fills
+        while prev.weekday() >= 5 or prev in hol:
+            prev -= dt.timedelta(days=1)
+        return prev
+
+    def _history_cached(self, key, interval, days):
+        """आधीचे दिवस बदलत नाहीत ⇒ history दिवसातून एकदा (disk cache: key + interval + days + आजची तारीख + अपेक्षित शेवटचा session).
+        अपेक्षित दिवस = 15M history चा शेवटचा session ⇒ सुट्टीनंतर cache भरतो (आधी कालचा weekday ⇒ सुट्टी दिवशी cache कधीच नाही ⇒ 90 दिवस
+        1m प्रत्येक cycle). 15M ला नंतर नवा दिवस आला ⇒ नवी key ⇒ पुन्हा fetch. Cache त्रुटी ⇒ साधा fetch."""
+        tag = "".join(ch if ch.isalnum() else "_" for ch in f"{key}_{interval}_{int(days)}")
+        want = self.expected_last_session()
+        p = os.path.join(cache_dir(), f"hist_{tag}_{self.today.isoformat()}_{want.isoformat()}.pkl")
+        try:
+            if os.path.exists(p):
+                with open(p, "rb") as f:
+                    return pickle.load(f)
+        except Exception:                                                # noqa: BLE001
+            pass
+        out = self._history(key, interval, days)
+        last = _last_date(out, self.today)
+        if last is None or last < want:                                  # अपेक्षित शेवटचा दिवस अजून नाही (उशीर) ⇒ cache नाही, पुढच्या cycle ला पुन्हा
+            return out
+        if self.cache and not _day_complete(out, last, interval):       # M56 O1 (live cache): the last day's closing bar not there yet ⇒ no cache
+            return out
+        _write_pickle(p, out)                                            # process प्रमाणे tmp (दोन runs एकाच वेळी ⇒ एकमेकांची tmp नाही)
+        try:
+            for old in os.listdir(cache_dir()):                          # जुन्या दिवसांच्या history files
+                if old.startswith(f"hist_{tag}_") and old.endswith(".pkl") and old != os.path.basename(p):
+                    os.remove(os.path.join(cache_dir(), old))
+        except Exception:                                                # noqa: BLE001
+            pass
+        return out
+
+    def _fill_recent_days(self, key, interval, rows, lookback=7):
+        """History मध्ये शेवटच्या दिवसानंतरचे (आज वगळून) weekday दिवस गायब असतील तर ते एकेक-दिवस मागवून भरतो (सुट्टी ⇒ रिकामं, चालतं)."""
+        import atp_private.trade_engine.verify_opportunity_data_availability as V
+        last = max((pd.Timestamp(str(c[0])[:10]).date() for c in rows), default=None)
+        if last is None:
+            return []
+        extra, d = [], max(last + dt.timedelta(days=1), self.today - dt.timedelta(days=lookback))
+        while d < self.today:
+            if d.weekday() < 5:
+                _count_get()
+                r = V.fetch_candles_window(self.token, key, interval, d, d)
+                raise_if_token_rejected(f"{key} {interval} {d} history", r["status"], None, r["error"])
+                if r["status"] != 200:
+                    raise EngineDataError(f"{key} {interval} {d} history HTTP {r['status']} ({str(r['error'])[:80]})")
+                extra.extend(r["candles"])
+            d += dt.timedelta(days=1)
+        return extra
+
+    def index(self, symbol, interval, days):
+        if interval == "1minute":                                        # Z-1o: history दिवसातून एकदा (cache) + आजचा intraday
+            key = index_key(symbol)
+            return candles_df(self._history_cached(key, interval, days) + self._intraday(key, interval))
+        return self._series(index_key(symbol), interval, days)
+
+    def future_info(self, symbol):
+        """resolve_future; cache ⇒ once a day per symbol (disk: the front month cannot change inside a day — expiry ≥ today)."""
+        if not self.cache:
+            return resolve_future(self.token, symbol, self.today)
+        p = os.path.join(cache_dir(), f"hist_fut_{str(symbol).upper()}_{self.today.isoformat()}.pkl")
+        try:
+            if os.path.exists(p):
+                with open(p, "rb") as f:
+                    return pickle.load(f)
+        except Exception:                                                # noqa: BLE001
+            pass
+        info = resolve_future(self.token, symbol, self.today)
+        _write_pickle(p, info)
+        return info
+
+    def futures(self, symbol, interval, days):
+        info = self.future_info(symbol)
+        f = self._series(info["instrument_key"], interval, days, contract=info["trading_symbol"])
+        return f.assign(expiry=pd.Timestamp(info["expiry"])) if len(f) else f     # legs2.volume.near_month साठी
+
+    def stored_bars(self, symbol, interval, days, before, max_chunks=None):
+        """M56 E1 (A1, DECISIONS 98): the stored history of `interval` before the date `before` (exclusive), back `days` — a
+        persistent disk store (`store_*.pkl`, never pruned: closed days do not change), filled incrementally: the days after the
+        stored newest day (up to `before`) and, while the store does not reach back `days`, older chunks — at most `max_chunks` GETs of
+        backfill per call (None = all; the live cycle passes `engine3_store_chunks_per_cycle`, the pre-open fill passes None), so a first
+        fill never runs inside one trigger cycle. Only Upstox's "invalid date range" answer (HTTP 400) ends the backfill for good (= all
+        the history it has); any other failure (429 / 5xx / timeout) raises and leaves the store as it was (retried next call).
+        Candles list ([ts, o, h, l, c, v, oi], …) of the days stored so far."""
+        import atp_private.trade_engine.verify_opportunity_data_availability as V
+        key = index_key(symbol)
+        tag = "".join(ch if ch.isalnum() else "_" for ch in f"{key}_{interval}")
+        p = os.path.join(cache_dir(), f"store_{tag}.pkl")
+        st = None
+        try:
+            if os.path.exists(p):
+                with open(p, "rb") as f:
+                    st = pickle.load(f)
+        except Exception:                                                # noqa: BLE001 — unreadable store ⇒ refill
+            st = None
+        if not isinstance(st, dict) or not isinstance(st.get("candles"), list) or "lo" not in st:
+            st = {"lo": None, "to": None, "floor": None, "candles": []}
+        want0, end = self.today - dt.timedelta(days=int(days)), before - dt.timedelta(days=1)
+        budget = [None if max_chunks is None else max(0, int(max_chunks))]
+
+        def get(f0, to):
+            _count_get()                                                 # M56 O1: one GET counter for every Upstox call
+            r = V.fetch_candles_window(self.token, key, interval, f0, to)
+            raise_if_token_rejected(f"{key} {interval} store", r["status"], None, r["error"])
+            return r
+
+        def unserved(r):
+            return r["status"] == 400 and "invalid" in str(r.get("error") or "").lower()
+
+        new, changed = [], False
+        if st["to"] is None:                                             # first call: the newest chunk (counts in the budget)
+            f0 = max(want0, end - dt.timedelta(days=self.CHUNK[interval]))
+            r = get(f0, end)
+            if r["status"] != 200:
+                raise EngineDataError(f"{key} {interval} store HTTP {r['status']} ({str(r['error'])[:80]})")
+            new.extend(r["candles"])
+            st.update(to=end, lo=f0)
+            changed = True
+            if budget[0] is not None:
+                budget[0] -= 1
+        elif st["to"] < end:                                             # the days after the stored part (small; holidays ⇒ empty)
+            to = end
+            while to > st["to"]:
+                f0 = max(st["to"] + dt.timedelta(days=1), to - dt.timedelta(days=self.CHUNK[interval]))
+                r = get(f0, to)
+                if r["status"] != 200:
+                    raise EngineDataError(f"{key} {interval} store HTTP {r['status']} ({str(r['error'])[:80]})")
+                new.extend(r["candles"])
+                to = f0 - dt.timedelta(days=1)
+            st["to"], changed = end, True
+        while st["lo"] > want0 and st["floor"] is None and (budget[0] is None or budget[0] > 0):
+            to = st["lo"] - dt.timedelta(days=1)
+            f0 = max(want0, to - dt.timedelta(days=self.CHUNK[interval]))
+            r = get(f0, to)
+            if budget[0] is not None:
+                budget[0] -= 1
+            if unserved(r):                                              # nothing older at Upstox ⇒ the store starts here
+                st["floor"], changed = st["lo"], True
+                break
+            if r["status"] != 200:
+                if changed:
+                    break                                                # keep what came; the rest next call
+                raise EngineDataError(f"{key} {interval} store HTTP {r['status']} ({str(r['error'])[:80]})")
+            new.extend(r["candles"])
+            st["lo"], changed = f0, True
+        if changed:
+            seen, merged = set(), []
+            for c in sorted(new + st["candles"], key=lambda c: str(c[0])):
+                if str(c[0]) not in seen:
+                    seen.add(str(c[0]))
+                    merged.append(c)
+            st["candles"] = merged
+            try:
+                os.makedirs(cache_dir(), exist_ok=True)
+                tmp = f"{p}.{os.getpid()}.tmp"
+                with open(tmp, "wb") as f:
+                    pickle.dump(st, f)
+                os.replace(tmp, p)
+            except Exception:                                            # noqa: BLE001 — not stored ⇒ refetched next run
+                pass
+        complete = st["lo"] <= want0 or st["floor"] is not None
+        self.store_state = {"complete": bool(complete), "from": str(st["lo"]), "floor": None if st["floor"] is None else str(st["floor"])}
+        return [c for c in st["candles"] if want0 <= pd.Timestamp(str(c[0])[:10]).date() < before]
+
+
+def _holidays():
+    try:
+        import atp_private.trade_engine.config as config
+        return config.nse_holidays()
+    except Exception:                                                    # noqa: BLE001 — no list ⇒ weekdays only (old rule)
+        return set()
+
+
+def _day_complete(candles, day, interval):
+    """The day's last bar is the session's closing bar (start = close − bar length; the close = the owner-listed special / early-close
+    session of that day, else 15:30); 'day' bars ⇒ always True. 1m ⇒ a last bar inside the final 15M bin is enough (Upstox 1m history
+    may lack the very last minute — never 90 days of 1m again every cycle for one missing minute)."""
+    mins = {"1minute": 1, "5minute": 5, "15minute": 15}.get(interval)
+    if mins is None:
+        return True
+    close = SESSION_CLOSE[0] * 60 + SESSION_CLOSE[1]
+    try:
+        import atp_private.trade_engine.config as config
+        w = config.special_session(day)
+        if w:
+            close = w[1].hour * 60 + w[1].minute
+    except Exception:                                                    # noqa: BLE001 — no calendar ⇒ the normal close
+        pass
+    want = close - (15 if interval == "1minute" else mins)
+    tods = [int(str(c[0])[11:13]) * 60 + int(str(c[0])[14:16]) for c in candles or [] if str(c[0])[:10] == day.isoformat()]
+    return bool(tods) and max(tods) >= want
+
+
+def _write_pickle(p, obj):
+    """Atomic cache write (a per-process tmp ⇒ two runs never share one); a cache error never fails the run."""
+    try:
+        os.makedirs(cache_dir(), exist_ok=True)
+        tmp = f"{p}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f)
+        os.replace(tmp, p)
+    except Exception:                                                    # noqa: BLE001
+        pass
+
+
+def _last_date(candles, today):
+    """Candles list मधला आजच्या आधीचा शेवटचा दिवस (नाही ⇒ None)."""
+    return max((d for d in (pd.Timestamp(str(c[0])[:10]).date() for c in candles or []) if d < today), default=None)
+
+
+# ------------------------------------------------------------------------------------------------ frames
+def candles_df(candles, contract=None):
+    from atp_private.trade_engine.opportunity_engine.volume import candles_to_df
+    return candles_to_df(candles, contract=contract)
+
+
+def _naive(df):
+    df = df.copy()
+    ts = pd.to_datetime(df["timestamp"])
+    if getattr(ts.dt, "tz", None) is not None:
+        ts = ts.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    df["timestamp"] = ts
+    return df.drop_duplicates("timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
+
+
+def closed_session_bars(df, minutes, now):
+    """फक्त बंद (start + minutes ≤ now) आणि session मधले (09:15 ≤ start, end ≤ 15:30) candles, bar_end सह."""
+    if df is None or not len(df):
+        return pd.DataFrame(columns=["timestamp", "bar_end", "open", "high", "low", "close", "volume"])
+    df = _naive(df)
+    end = df["timestamp"] + pd.Timedelta(minutes=minutes)
+    tod = df["timestamp"].dt.hour * 60 + df["timestamp"].dt.minute
+    eod = end.dt.hour * 60 + end.dt.minute
+    keep = (end <= pd.Timestamp(now)) & (tod >= SESSION_OPEN[0] * 60 + SESSION_OPEN[1]) & (eod <= SESSION_CLOSE[0] * 60 + SESSION_CLOSE[1])
+    out = df[keep.to_numpy()].assign(bar_end=end[keep.to_numpy()]).reset_index(drop=True)
+    if "volume" not in out.columns:
+        out["volume"] = 0.0
+    return out[["timestamp", "bar_end", "open", "high", "low", "close", "volume"] + (["contract"] if "contract" in out.columns else [])]
+
+
+def fut_volume_15m(m15, fut5):
+    """FUT 5M volume ⇒ 15M bins (09:15 anchored, bar start = 15M timestamp). जुळलं नाही ⇒ 0 (अंदाज नाही)."""
+    if fut5 is None or not len(fut5):
+        return pd.Series(0.0, index=m15.index)
+    f = _naive(fut5)
+    b = f["timestamp"].dt.floor("15min")
+    vol = f.groupby(b)["volume"].sum()
+    return pd.to_datetime(m15["timestamp"]).map(vol).fillna(0.0).astype(float)
+
+
+# ------------------------------------------------------------------------------------------------ Daily fold cache
+def _fold_key(df, s):
+    h = hashlib.sha1()
+    h.update(pd.util.hash_pandas_object(df.reset_index(drop=True), index=False).values.tobytes())
+    h.update(repr(sorted((k, repr(v)) for k, v in (s or {}).items())).encode())
+    return h.hexdigest()[:24]
+
+
+class fold_cache:
+    """`decision3.daily.fold` ला तात्पुरता disk cache (input hash ⇒ तोच निकाल). कोणतीही cache त्रुटी ⇒ साधी गणना."""
+
+    def __init__(self, tag):
+        self.tag = tag
+
+    def __enter__(self):
+        from atp_private.trade_engine.decision3 import daily as DD
+        self.DD, self.orig = DD, DD.fold
+        d = cache_dir()
+
+        def fold(df, s=None, *a, **k):
+            if a or k:
+                return self.orig(df, s, *a, **k)
+            try:
+                p = os.path.join(d, f"fold_{self.tag}_{_fold_key(df, s)}.pkl")
+                if os.path.exists(p):
+                    with open(p, "rb") as f:
+                        return pickle.load(f)
+            except Exception:                                            # noqa: BLE001
+                p = None
+            res = self.orig(df, s)
+            try:
+                if p:
+                    os.makedirs(d, exist_ok=True)
+                    tmp = f"{p}.{os.getpid()}.tmp"
+                    with open(tmp, "wb") as f:
+                        pickle.dump(res, f)
+                    os.replace(tmp, p)
+            except Exception:                                            # noqa: BLE001
+                pass
+            return res
+        DD.fold = fold
+        return self
+
+    def __exit__(self, *exc):
+        self.DD.fold = self.orig
+        return False
+
+
+CACHE_PREFIXES = ("hist_", "fold_", "profile_check.json.")              # फक्त हेच (आणि त्यांचे .tmp) prune होतात; M56: + stale profile-check tmp
+
+
+def cache_keep_days(v=None):
+    """`engine3_cache_keep_days` ⇒ float ≥ 1. रिकामं / चुकीचं / ऋण ⇒ default (3); 0–1 ⇒ 1 (आजच्या cache files कधीच नाही काढत)."""
+    dflt = float(DEFAULTS["engine3_cache_keep_days"])
+    try:
+        k = dflt if v in (None, "") else float(v)
+    except (TypeError, ValueError):
+        return dflt
+    if k != k or k < 0:                                                  # NaN / ऋण ⇒ default
+        return dflt
+    return max(1.0, k)
+
+
+def prune_cache(keep_days=None, now=None):
+    """data/engine3_cache मधल्या फक्त engine3 cache files (`hist_*` / `fold_*`, .tmp उरलेल्यांसह) — `keep_days` (setting
+    `engine3_cache_keep_days`, किमान 1) पेक्षा जुन्या (mtime) — काढतो. इतर files ना हात नाही. एक listdir, स्वस्त. कधीच raise नाही."""
+    keep_days = cache_keep_days(keep_days)
+    d = cache_dir()
+    if not os.path.isdir(d):
+        return
+    cut = (now.timestamp() if now is not None else dt.datetime.now(dt.timezone.utc).timestamp()) - keep_days * 86400   # epoch vs mtime
+    for f in os.listdir(d):
+        stray = f.startswith("store_") and f.endswith(".tmp")             # M56 E1: a store write left by a killed run (the store stays)
+        if not stray and (not f.startswith(CACHE_PREFIXES) or not (f.endswith(".pkl") or f.endswith(".tmp"))):
+            continue
+        try:
+            p = os.path.join(d, f)
+            if os.path.isfile(p) and os.path.getmtime(p) < cut:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------------------------------------ inputs ⇒ V22
+def v22_kwargs():
+    """V22 चे optional live kwargs (ltf / futures) आहेत का — confirmation branch merge आधी / नंतर दोन्हीवर चालावं."""
+    from atp_private.trade_engine.decision3 import engine as E3
+    return set(inspect.signature(E3.V22.__init__).parameters)
+
+
+def build_inputs(feed, symbol, now, s=None, levels_only=False):
+    """(m15, daily, ltf5, fut5|None, volume note|None). 15M / Daily / 5M LTF अपुरा ⇒ EngineDataError (fail-closed); FUT नाही ⇒ volume NA.
+    levels_only (pre-open areas) ⇒ फक्त 15M + Daily (ltf / fut / note = None; शेवटचा उपलब्ध बंद bar)."""
+    from atp_private.trade_engine.bots_common import level_reaction as LR
+    from atp_private.trade_engine.decision3 import history as HI
+    from atp_private.trade_engine.elliott import data_policy as DP
+    s = {**DEFAULTS, **(s or {})}
+    now = pd.Timestamp(now)
+    m15 = closed_session_bars(feed.index(symbol, "15minute", s["engine3_m15_days"]), 15, now)
+    if HI.is_nifty(symbol):
+        m15 = DP.filter_allowed(m15, "annotation")                      # NIFTY: holdout row कधीच नाही (15M engine input)
+    if len(m15) < 200:
+        raise EngineDataError(f"{symbol}: 15M candles अपुरे ({len(m15)})")
+    want = now.floor("15min")
+    if not levels_only:
+        bar_final_wait(symbol, m15, now, s)                              # M56 E3: the trigger bar's close + the final grace
+    grace = pd.Timedelta(minutes=float(s.get("engine3_bar_grace_min", 2)))
+    if not levels_only and pd.Timestamp(m15["bar_end"].iloc[-1]) < want and SESSION_OPEN < (want.hour, want.minute) <= SESSION_CLOSE:
+        # M53 MS-1: a bar is late only after its close + the grace; before that this cycle waits silently (the next minute decides)
+        msg = f"{symbol}: शेवटचा बंद 15M ({want:%H:%M}) अजून Upstox कडे नाही (last {m15['bar_end'].iloc[-1]:%H:%M})"
+        if now < want + grace and pd.Timestamp(m15["bar_end"].iloc[-1]) >= want - pd.Timedelta(minutes=15):   # only the due bar
+            raise BarLate(msg + " — within the grace, silent retry", one_bar=True)
+        raise EngineDataError(msg)
+    if not levels_only and (want.hour, want.minute) == SESSION_OPEN and pd.Timestamp(m15["bar_end"].iloc[-1]) < want:
+        raise BarLate(f"{symbol}: the session's first 15M bar closes at {want + pd.Timedelta(minutes=15):%H:%M} — nothing closed yet "
+                      "(expected wait, silent)", one_bar=True)          # M53 MS-1: 09:15–09:29 is never a data alarm
+    dd = feed.index(symbol, "day", s["engine3_daily_days"])
+    if dd is None or len(dd) < 30:
+        raise EngineDataError(f"{symbol}: Daily candles अपुरे ({0 if dd is None else len(dd)})")
+    daily = LR.prepare_daily(_naive(dd)[["timestamp", "open", "high", "low", "close"]], now.normalize())
+    if len(daily) < 30:
+        raise EngineDataError(f"{symbol}: Daily candles अपुरे ({len(daily)})")
+    if levels_only:
+        try:                                                             # DECISIONS 84: the 5M shows the close print the 15M hides
+            ltf = closed_session_bars(feed.index(symbol, "5minute", s["engine3_ltf_days"]), 5, now)
+            ltf = DP.filter_allowed(ltf, "annotation") if HI.is_nifty(symbol) else ltf
+        except TokenRejected:
+            raise
+        except Exception as exc:                                         # noqa: BLE001 — areas still build; the miss is logged
+            print(f"⚠️ {str(symbol).upper()} engine3: 5M नाही ⇒ close-print marks फक्त 15M वरून ({type(exc).__name__})")
+            ltf = None
+        m15, _ = mark_close_prints(symbol, m15, ltf)
+        return m15, daily, None, None, None
+    ltf = closed_session_bars(feed.index(symbol, "5minute", s["engine3_ltf_days"]), 5, now)
+    if HI.is_nifty(symbol):
+        ltf = DP.filter_allowed(ltf, "annotation")
+    m15, ltf = mark_close_prints(symbol, m15, ltf)
+    if not len(ltf) or ltf["timestamp"].iloc[-1].normalize() != m15["timestamp"].iloc[-1].normalize():
+        raise EngineDataError(f"{symbol}: 5M spot (LTF) data नाही ⇒ c1 CHoCH तपासता येत नाही")
+    tf5 = trigger_tf_of(s) == "5M"
+    want5 = now.floor("5min")
+    in5 = SESSION_OPEN < (want5.hour, want5.minute) <= SESSION_CLOSE and want5.normalize() == m15["timestamp"].iloc[-1].normalize()
+    if tf5 and in5 and pd.Timestamp(ltf["bar_end"].iloc[-1]) < want5:   # DECISIONS 37: the 5M close being decided must be there
+        raise BarLate(f"{symbol}: शेवटचा बंद 5M spot ({want5:%H:%M}) अजून Upstox कडे नाही (last {ltf['bar_end'].iloc[-1]:%H:%M})",
+                      one_bar=pd.Timestamp(ltf["bar_end"].iloc[-1]) >= want5 - pd.Timedelta(minutes=5))
+    fut, note = None, None
+    try:                                                                 # c0 / a2 volume (raw FUT bars, method §3; approach leg may reach back)
+        fut = closed_session_bars(feed.futures(symbol, "5minute", s["engine3_fut_days"]), 5, now)
+        today_fut = fut[fut["timestamp"].dt.normalize() == m15["timestamp"].iloc[-1].normalize()] if len(fut) else fut
+        if not len(today_fut) or float(today_fut["volume"].sum()) <= 0:
+            fut, note = None, f"{symbol}: FUT 5M volume (आज) नाही"
+        elif tf5 and in5 and pd.Timestamp(today_fut["bar_end"].iloc[-1]) < want5:   # DECISIONS 37: the FUT 5M bar of that close too
+            raise FutBarLate(f"{symbol}: शेवटचा बंद FUT 5M ({want5:%H:%M}) अजून Upstox कडे नाही "
+                                  f"(last {today_fut['bar_end'].iloc[-1]:%H:%M})",
+                             one_bar=pd.Timestamp(today_fut["bar_end"].iloc[-1]) >= want5 - pd.Timedelta(minutes=5))
+    except (TokenRejected, FutBarLate):                                  # token नाकारला / 5M FUT bar उशिरा ⇒ खरं कारण
+        raise
+    except Exception as exc:                                             # noqa: BLE001
+        fut, note = None, f"{symbol}: FUT volume नाही ({type(exc).__name__}: {str(exc)[:80]})"
+    if fut is None:
+        if str(symbol).upper() in FUT_REQUIRED:                           # Abhi Z-1c: data error ⇒ entry नाही (+ Telegram, दिवसातून एकदा)
+            raise FutVolumeMissing(f"{DATA_PROBLEM_FUT} ({note})")
+        note += " ⇒ volume NA ⇒ c0 data problem (volume शिवाय entry नाही)"
+    return m15, daily, ltf, fut, note
+
+
+def final_grace(s=None):
+    """`engine3_bar_final_grace_s` (seconds, operational) ⇒ Timedelta ≥ 0; empty / bad ⇒ the default."""
+    v = (s or {}).get("engine3_bar_final_grace_s")
+    try:
+        g = float(DEFAULTS["engine3_bar_final_grace_s"] if v in (None, "") else v)
+    except (TypeError, ValueError):
+        g = float(DEFAULTS["engine3_bar_final_grace_s"])
+    return pd.Timedelta(seconds=max(0.0, g if g == g else float(DEFAULTS["engine3_bar_final_grace_s"])))
+
+
+def bar_final_wait(symbol, m15, now, s=None):
+    """M56 E3 (A3): the trigger bar (5M, or 15M when `engine3_trigger_tf` = 15M) that closed at the last close is decided only once
+    `engine3_bar_final_grace_s` has passed after that close — before it, Upstox's bar may still be the forming one ⇒ BarLate (one bar,
+    silent retry; the resident's next try decides it). Outside the session / another day ⇒ nothing."""
+    tf = 5 if trigger_tf_of(s) == "5M" else 15
+    close = pd.Timestamp(now).floor(f"{tf}min")
+    if not (SESSION_OPEN < (close.hour, close.minute) <= SESSION_CLOSE) or not len(m15) \
+            or close.normalize() != pd.Timestamp(m15["timestamp"].iloc[-1]).normalize():
+        return
+    g = final_grace(s)
+    if pd.Timestamp(now) < close + g:
+        raise BarLate(f"{symbol}: the {tf}M bar of {close:%H:%M} is final only {g.total_seconds():.0f} s after its close "
+                      f"(now {pd.Timestamp(now):%H:%M:%S}) — silent retry", one_bar=True)
+
+
+def bar_ohlc(frame, bar_end):
+    """The OHLC of the bar ending at `bar_end` in a closed-bars frame (with `bar_end`) ⇒ {"open", "high", "low", "close"} | None."""
+    if frame is None or not len(frame) or "bar_end" not in frame.columns:
+        return None
+    x = frame[pd.to_datetime(frame["bar_end"]) == pd.Timestamp(bar_end)]
+    if not len(x):
+        return None
+    r = x.iloc[-1]
+    return {k: round(float(r[k]), 2) for k in ("open", "high", "low", "close")}
+
+
+def bar_revision(prev, frame):
+    """M56 E3 (A3): the stored trigger bar of the previous cycle (`prev` = {"bar_ts", "bar_ohlc", "revised"}) against the same bar in
+    this cycle's fetch ⇒ {"bar_ts", "stored", "fetched"} when Upstox revised it (OHLC differ), else None. A row that was itself
+    re-decided for a revision (`revised`) is never re-decided again (once)."""
+    if not isinstance(prev, dict) or prev.get("revised") or not isinstance(prev.get("bar_ohlc"), dict):
+        return None
+    now_b = bar_ohlc(frame, prev["bar_ts"])
+    if now_b is None:
+        return None
+    old = {k: round(float(prev["bar_ohlc"][k]), 2) for k in ("open", "high", "low", "close") if prev["bar_ohlc"].get(k) is not None}
+    if len(old) == 4 and old != now_b:
+        return {"bar_ts": str(pd.Timestamp(prev["bar_ts"])), "stored": old, "fetched": now_b}
+    return None
+
+
+def mark_close_prints(symbol, m15, ltf=None):
+    """DECISIONS 84 (R5-3) at the source: Upstox's NSE_INDEX candles since NSE's cash closing auction (CAS, opportunity_engine/cas.py) end each session with
+    identical flat bars (the 15:15 value) and one auction-close print — not traded bars. Both frames get the `data_problem` column
+    (decision3.history.mark_data_problems: the 5M by its own bars, the 15M from the 5M under it); prices are never changed. The
+    reader never takes a base, zone or swing extreme from a marked bar (swings2 / levels / refined origin)."""
+    from atp_private.trade_engine.decision3 import history as HI
+    name = str(symbol).upper()
+    m15 = HI.mark_data_problems(m15, name, "15M", finer=ltf)
+    if ltf is not None and len(ltf):
+        ltf = HI.mark_data_problems(ltf, name, "5M")
+        HI.cas_sanity(ltf, log_fn=lambda m: print(f"⚠️ {name} engine3: {m}"))   # M56 E4: the clock window = a sanity check only
+    return m15, ltf
+
+
+def use_1m(s=None):
+    """Setting `engine3_use_1m` (dashboard, default True — Abhi Z-1o (a)). "false" / "0" / "no" / "off" ⇒ False; None / "" (रिकामं) ⇒
+    default (True)."""
+    v = (s or {}).get("engine3_use_1m")
+    if v is None or (isinstance(v, str) and not v.strip()):
+        v = DEFAULTS["engine3_use_1m"]
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "no", "off")
+    return bool(v)
+
+
+def swing_scale(s=None):
+    """Abhi calibration (layer 1 ✅): advanced dashboard `engine3_swing_k_d1` / `engine3_swing_k_d2` ⇒ V22 settings {"swing_k": {1: k, 2: k}}.
+    रिकामं / None ⇒ None (swings2 चा approved scale, D1 = 4, D2 = 6). Bad value ⇒ ValueError (engine run fails closed, Telegram)."""
+    k = {}
+    for d in (1, 2):
+        v = (s or {}).get(f"engine3_swing_k_d{d}")
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        k[d] = float(v)
+    if not k:
+        return None
+    from atp_private.trade_engine.decision3 import engine as E3
+    E3.swing_scale({"swing_k": k})                                       # refuse a bad value here (never blamed on the 1m fallback)
+    return {"swing_k": k}
+
+
+class SettingError(ValueError):
+    """A bad dashboard `engine3_*` setting (not a data problem): the engine run fails closed and the Telegram line says to fix the
+    setting on the dashboard (`setting_error`, read by scripts/engine_signal_run.py)."""
+    setting_error = True
+
+
+DAILY_PIVOT_N_MAX = 5                                                      # registered range 1/2/3 (+ margin): a huge N would leave the
+                                                                           # Daily trend unknown and silently stop entries
+
+
+def daily_pivot_n(s=None):
+    """Abhi (L1-c): advanced dashboard `engine3_daily_pivot_n` ⇒ V22 settings {"daily_pivot_n": N} (swing = N bars on both sides, for
+    the Daily and the Weekly parent folds; live decision and pre-open levels). रिकामं / None / decision3's default (provisional N = 2) ⇒
+    None (today's behaviour). Not a whole number in 1..DAILY_PIVOT_N_MAX ⇒ ValueError (the engine run fails closed: error row +
+    Telegram) — before any data fetch."""
+    from atp_private.trade_engine.decision3 import settings as S3
+    v = (s or {}).get("engine3_daily_pivot_n")
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        if isinstance(v, bool):
+            raise ValueError
+        f = float(str(v).strip())
+        if not (math.isfinite(f) and f == int(f) and 1 <= f <= DAILY_PIVOT_N_MAX):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError(f"engine3_daily_pivot_n = {v!r} — a whole number 1..{DAILY_PIVOT_N_MAX} "
+                         f"(empty = {S3.DEFAULTS['daily_pivot_n']}, provisional)") from None
+    n = int(f)
+    return None if n == S3.DEFAULTS["daily_pivot_n"] else {"daily_pivot_n": n}
+
+
+# Abhi (live switches): each finished Chart Reader layer can fall back to its legacy what-if from the dashboard (advanced, 15M SRv2 engine
+# block) without a deploy. Dashboard key ⇒ (decision3 V22 setting, allowed values — the method first (= decision3's default), then the
+# registered legacy what-ifs (decision3/settings.py REGISTER), label). Empty / None / the method ⇒ V22 gets nothing ⇒ today's behaviour
+# byte-for-byte.
+METHOD_SWITCHES = {
+    "engine3_zone_visit_rule": ("zone_visit_rule", ("structure", "close_away", "touch_window"), "layer 3 visit"),
+    "engine3_commit_volume_rule": ("commit_volume_rule", ("approach_and_opposite", "opposite"), "layer 3 commitment volume"),
+    "engine3_line_rule": ("line_rule", ("logic", "sigma"), "layer 4 lines"),
+    "engine3_div_degree_rule": ("div_degree_rule", ("turns", "zone", "all"), "layer 5 RSI divergence"),
+    "engine3_verdict_rule": ("verdict_rule", ("method", "score"), "layer 6a verdict"),
+    # Abhi 21 Oct (PA standard §3): the entry models E1–E4 decide (decision3 default); legacy_k = the old ③ BOS + K pullback gate + the
+    # old visit end, exactly as before the models — the no-deploy fallback for the live PAPER engine.
+    "engine3_entry_gate": ("entry_gate", ("models", "legacy_k"), "layer 3 entry gate (entry models E1–E4)"),
+    # Abhi 21 Oct (PA standard T1, ✅ deploy): the Daily leg's nature by comparison with its neighbouring legs; elliott = the old reading.
+    "engine3_daily_leg_read": ("daily_leg_read", ("compare", "elliott"), "layer 1 Daily leg nature"),
+    # Lead (provisional): overlapping same-role areas in one visit = one location (one signal per model per cluster); area = per area.
+    "engine3_entry_cluster_rule": ("entry_cluster_rule", ("cluster", "area"), "layer 3 entry models: one location per overlapping cluster"),
+    # Abhi 21 Oct (PA standard T7): the range from structure (Daily / Weekly fold + 1H / 15M); c13 = two equal highs + two equal lows.
+    "engine3_daily_range_rule": ("daily_range_rule", ("structure", "c13"), "layer 1 range (Daily / Weekly / 1H / 15M)"),
+    "engine3_range_state_rule": ("range_state_rule", ("structure", "overlap"), "row range state (context)"),
+    # Abhi (DECISIONS 37, owner rule): the entry trigger on 5M for every model; 15m = the earlier behaviour (what-if, byte-identical).
+    "engine3_trigger_tf": ("trigger_tf", ("5m", "15m"), "entry trigger timeframe (5M closes; DECISIONS 37)"),
+    # Abhi (DECISIONS 64, owner rule): the visit ends by structure (swings away that do not reach the area again), the move start moves
+    # forward; single_swing = the earlier visit end (what-if, byte-identical).
+    "engine3_visit_end_rule": ("visit_end_rule", ("away_not_reached", "single_swing"), "layer 3 visit end / move start (DECISIONS 64)"),
+}
+
+
+def trigger_tf_of(s=None):
+    """Dashboard `engine3_trigger_tf` ⇒ "5M" (default, Abhi's rule) / "15M" (what-if). Unknown ⇒ ValueError (as every switch)."""
+    return str(method_switches({"engine3_trigger_tf": (s or {}).get("engine3_trigger_tf")}).get("trigger_tf", "5m")).upper()
+
+
+def method_switches(s=None):
+    """Dashboard `engine3_*` layer switches ⇒ {V22 key: legacy value} — only the ones set away from the method (empty / the method ⇒
+    omitted). Unknown value, or a legacy visit rule without the legacy commitment volume (V22: "never a silent half-rule") ⇒ ValueError
+    with the reason (the engine run fails closed: error row + Telegram) — before any data fetch or instrument switch."""
+    out = {}
+    for key, (v22_key, allowed, _label) in METHOD_SWITCHES.items():
+        v = (s or {}).get(key)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        v = str(v).strip().lower()
+        if v not in allowed:
+            raise ValueError(f"{key} = {v!r} — allowed: {' / '.join(allowed)} (empty = {allowed[0]}, the method)")
+        if v != allowed[0]:
+            out[v22_key] = v
+    if out.get("zone_visit_rule") and out.get("commit_volume_rule") != "opposite":
+        raise ValueError(f"engine3_zone_visit_rule = {out['zone_visit_rule']!r} (legacy) knows no approach leg — set "
+                         "engine3_commit_volume_rule = 'opposite' with it")
+    return out
+
+
+# Model C (DECISIONS 32, T-3): the dashboard switches, ALL default OFF (the opposite of E1–E4) until Abhi switches it on after the
+# replay. engine3_model_c_on = the model (V22 `model_c`) and its live signal switch; engine3_model_c_<a…f>_on = each sub-way (V22
+# `model_c_subs`); engine3_c_window / engine3_c_a_nature / engine3_c_projections = the model's own settings (empty = decision3's default).
+MODEL_C_KEY = "engine3_model_c_on"
+
+
+def model_c_sub_key(sub):
+    """"C-a" ⇒ "engine3_model_c_a_on"."""
+    return f"engine3_model_c_{str(sub).split('-')[-1].lower()}_on"
+
+
+def _truthy(v, default=False):
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "no", "off")
+    return bool(v)
+
+
+def model_c_settings(s=None):
+    """Dashboard model C keys ⇒ V22 settings; model C off (default) ⇒ None (V22 never reads model C — today's rows). Bad value ⇒
+    ValueError (fail closed)."""
+    from atp_private.trade_engine.decision3 import model_c as MDC
+    from atp_private.trade_engine.decision3 import settings as S3
+    s = s or {}
+    if not _truthy(s.get(MODEL_C_KEY), False):
+        return None
+    out = {"model_c": "on", "model_c_subs": [x for x in S3.MODEL_C_SUBS if _truthy(s.get(model_c_sub_key(x)), False)]}
+    for key, v22 in (("engine3_c_window", "c_window"), ("engine3_c_a_nature", "c_a_nature")):
+        v = s.get(key)
+        if v is not None and str(v).strip():
+            out[v22] = str(v).strip().lower()
+    pr = c_projections_of(s.get("engine3_c_projections"))
+    if pr is not None:
+        out["c_projections"] = pr
+    MDC.validate({**S3.DEFAULTS, **out})
+    return out
+
+
+def c_projections_of(v):
+    """Dashboard `engine3_c_projections` (display / context only, C-7) ⇒ a tuple of positive ratios or None (decision3's default).
+    Empty pieces are skipped ("1, 1.618," ⇒ (1.0, 1.618)); an unreadable value never stops the engine — a warning, then the default."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        parts = [x for x in (v.split(",") if isinstance(v, str) else v) if not (isinstance(x, str) and not x.strip())]
+        out = tuple(float(x) for x in parts)
+        if not out or not all(math.isfinite(r) and r > 0 for r in out):
+            raise ValueError
+        return out
+    except (TypeError, ValueError):
+        print(f"⚠️ engine3_c_projections = {v!r} unreadable (ratios separated by commas, display only) ⇒ the default is used")
+        return None
+
+
+def v22_settings(s=None):
+    """Dashboard `engine3_*` ⇒ V22 settings (`s`) for the live decision and the pre-open levels: the swing scale (layer 1), the Daily
+    pivot size (L1-c) + the layer switches. Nothing set ⇒ None (V22 on decision3's defaults = the method, today's behaviour). Bad value ⇒
+    ValueError (fail closed)."""
+    try:
+        out = {**(swing_scale(s) or {}), **(daily_pivot_n(s) or {}), **method_switches(s), **(model_c_settings(s) or {})}
+    except ValueError as exc:                                            # a setting error, not a data problem (Telegram says so)
+        raise SettingError(str(exc)) from exc
+    return out or None
+
+
+# ------------------------------------------------------------------------------------------------ dashboard (advanced) parsing
+def switch_label(key, v):
+    """Dashboard option label: the method ⇒ "<v> — method (default)"; a legacy value ⇒ "legacy what-if: <v>"."""
+    return f"{v} — method (default)" if v == METHOD_SWITCHES[key][1][0] else f"legacy what-if: {v}"
+
+
+def switch_choice(key, stored):
+    """Dashboard: a stored switch ⇒ (value to show, warning | None). Empty ⇒ the method; unknown ⇒ the method + a warning (a bad stored
+    value never breaks the page; saving then stores the method)."""
+    allowed = METHOD_SWITCHES[key][1]
+    v = str(stored if stored is not None else "").strip().lower()
+    if not v:
+        return allowed[0], None
+    if v not in allowed:
+        return allowed[0], f"{key}: stored {v!r} unknown ⇒ showing the method ({allowed[0]}); saving stores the method"
+    return v, None
+
+
+def switches_to_save(choices):
+    """Dashboard save: {key: chosen value} ⇒ ({key: stored value}, error | None). The method / unknown ⇒ "" (empty = the method). An
+    incoherent combo (`method_switches` refuses it, e.g. a legacy visit without the legacy commitment volume) ⇒ visit + commitment volume
+    stored as the method, with the reason."""
+    out = {}
+    for key, (_v22, allowed, _label) in METHOD_SWITCHES.items():
+        v = str((choices or {}).get(key) or "").strip().lower()
+        out[key] = v if v in allowed[1:] else ""
+    try:
+        method_switches(out)
+    except ValueError as exc:
+        out["engine3_zone_visit_rule"] = out["engine3_commit_volume_rule"] = ""
+        return out, str(exc)
+    return out, None
+
+
+def pivot_n_choice(stored):
+    """Dashboard: stored `engine3_daily_pivot_n` ⇒ (N to show, warning | None). Empty ⇒ decision3's provisional N (2); bad ⇒ that + a
+    warning (saving then stores empty)."""
+    from atp_private.trade_engine.decision3 import settings as S3
+    try:
+        got = daily_pivot_n({"engine3_daily_pivot_n": stored})
+    except ValueError as exc:
+        return int(S3.DEFAULTS["daily_pivot_n"]), f"{exc} ⇒ showing {S3.DEFAULTS['daily_pivot_n']}; saving stores empty"
+    return (got or {}).get("daily_pivot_n", int(S3.DEFAULTS["daily_pivot_n"])), None
+
+
+def pivot_n_to_save(n):
+    """Dashboard save: N ⇒ stored value. decision3's provisional N (2) or a bad value ⇒ "" (empty = 2); otherwise the whole number."""
+    try:
+        got = daily_pivot_n({"engine3_daily_pivot_n": n})
+    except ValueError:
+        return ""
+    return "" if got is None else int(got["daily_pivot_n"])
+
+
+def load_m1(feed, symbol, m15, now, s=None):
+    """Abhi Z-1o (a): spot 1m ⇒ (df1m | None, info). फक्त बंद 1m (start + 1 ≤ now), session मधले, m15 च्या पहिल्या bar पासून शेवटच्या
+    बंद 15M bar च्या bar_end पर्यंत (त्यानंतरचा 1m कधीच नाही ⇒ look-ahead नाही); NIFTY ⇒ holdout rows नाहीत. 1m नाही / त्रुटी ⇒ None +
+    कारण (जुना मार्ग; data error नाही). info = payload `m1`: used, setting, rows, m15_covered (1m rows असलेले 15M bars) / m15_bars,
+    m15_complete (V22 नंतर: swings2 m1_status "complete" bars — 1m चे high / low 15M शी जुळतात), note."""
+    from atp_private.trade_engine.decision3 import history as HI
+    from atp_private.trade_engine.elliott import data_policy as DP
+    s = {**DEFAULTS, **(s or {})}
+    if not use_1m(s):
+        return None, {"used": False, "setting": False, "note": "engine3_use_1m = False ⇒ 1m शिवाय (जुना मार्ग)"}
+
+    def fallback(why):
+        note = f"1m नाही ⇒ 1m शिवाय (जुना मार्ग): {why}"
+        print(f"⚠️ {str(symbol).upper()} engine3: {note}")
+        return None, {"used": False, "setting": True, "fallback": True, "note": note}
+    try:
+        raw = feed.index(symbol, "1minute", s["engine3_m15_days"])
+        m1 = closed_session_bars(raw, 1, now)
+        if HI.is_nifty(symbol):
+            m1 = DP.filter_allowed(m1, "annotation")
+    except TokenRejected:                                                # token नाकारला ⇒ 1m fallback नाही, fail-closed
+        raise
+    except Exception as exc:                                             # noqa: BLE001 — 1m हा आवश्यक input नाही
+        return fallback(f"{type(exc).__name__}: {str(exc)[:120]}")
+    if len(m15):
+        first, last_end = pd.Timestamp(m15["timestamp"].iloc[0]), pd.Timestamp(m15["bar_end"].iloc[-1])
+        m1 = m1[(m1["timestamp"] >= first) & (m1["bar_end"] <= last_end)]
+    if not len(m1):
+        return fallback("Upstox कडून 1m candles मिळाले नाहीत (या 15M window मध्ये)")
+    m1 = m1[["timestamp", "open", "high", "low", "close"]].reset_index(drop=True)
+    have = set(m1["timestamp"].dt.floor("15min"))
+    keys = pd.to_datetime(m15["timestamp"])
+    cov = int(keys.isin(have).sum())
+    info = {"used": True, "setting": True, "rows": int(len(m1)), "m15_covered": cov, "m15_bars": int(len(m15)), "note": None}
+    if len(m15) and pd.Timestamp(keys.iloc[-1]) not in have:
+        info["note"] = "शेवटच्या 15M bar चा 1m नाही (intraday उशीर) ⇒ त्या bar चा क्रम 1m शिवाय"
+    elif cov < len(m15):
+        info["note"] = f"1m {cov}/{len(m15)} 15M bars (बाकी bars चा क्रम 1m शिवाय)"
+    return m1, info
+
+
+def h1_history_of(feed, symbol, m15, now, s=None, full=False):
+    """M56 E1 (A1, DECISIONS 98 "1H / Daily swings from the full stored history"): the 1H bars BEFORE the 15M window, built by the same
+    builder the tested reader uses (`levels.h1_history`: the stored 15M bars before the window's first bar, DP-marked from the stored
+    5M under them — DECISIONS 84 — then `levels.h1_frame`) ⇒ (h1_history | None, info). The bars = the feed's persistent stores
+    (`UpstoxFeed.stored_bars`, `engine3_h1_history_days`); a live cycle backfills at most `engine3_store_chunks_per_cycle` GETs per
+    store, `full` (the pre-open) fills all. Session bars only; NIFTY ⇒ no holdout row. No store / store error ⇒ None (the old path: 1H
+    swings from the window only) + the reason (logged, one ⚠️ per cause per day — DECISIONS 47; info = payload `h1_history`), never
+    fail-closed. Token rejected ⇒ raised."""
+    from atp_private.trade_engine.decision3 import history as HI
+    from atp_private.trade_engine.decision3 import levels as LV
+    from atp_private.trade_engine.elliott import data_policy as DP
+    s = {**DEFAULTS, **(s or {})}
+
+    def fallback(why):
+        note = f"1H history नाही ⇒ 1H swings फक्त 15M window वरून (जुना मार्ग): {why}"
+        print(f"⚠️ {str(symbol).upper()} engine3: {note}")
+        try:
+            from atp_private.trade_engine.bots_common import gate_alert as GA                     # DECISIONS 47: one ⚠️ per cause per day, never blocks
+            GA.alert("engine_h1_history", symbol, why)
+        except Exception:                                                # noqa: BLE001 — an alert never stops the cycle
+            pass
+        return None, {"used": False, "note": note}
+    get = getattr(feed, "stored_bars", None)
+    if get is None or m15 is None or not len(m15):
+        return None, {"used": False, "note": "feed has no stored history" if get is None else "no 15M window"}
+    first = pd.Timestamp(m15["timestamp"].iloc[0])
+    cap = None if full else s["engine3_store_chunks_per_cycle"]
+
+    def frame(interval, minutes):
+        raw = candles_df(get(symbol, interval, s["engine3_h1_history_days"], first.date(), max_chunks=cap))
+        x = closed_session_bars(raw, minutes, now) if raw is not None and len(raw) else None
+        if x is not None and HI.is_nifty(symbol):
+            x = DP.filter_allowed(x, "annotation")
+        return None if x is None or not len(x) else \
+            x[x["timestamp"] < first][["timestamp", "open", "high", "low", "close"]].reset_index(drop=True)
+    try:
+        pre = frame("15minute", 15)
+        done = dict(getattr(feed, "store_state", None) or {})
+        pre5 = frame("5minute", 5)
+    except TokenRejected:
+        raise
+    except Exception as exc:                                             # noqa: BLE001 — the 1H history is not a required input
+        return fallback(f"{type(exc).__name__}: {str(exc)[:120]}")
+    if pre is None or not len(pre):
+        return fallback("no stored 15M bars before the window")
+    h1h = LV.h1_history(pre, symbol, finer=pre5)
+    note = None if done.get("complete", True) else f"store still filling (from {done.get('from')}; the pre-open fills the rest)"
+    return h1h, {"used": True, "bars": int(len(h1h)), "first": str(pd.Timestamp(h1h["timestamp"].iloc[0])), "note": note,
+                 "dp_marked_from_5m": pre5 is not None and len(pre5) > 0}
+
+
+def evaluate(symbol, m15, daily, ltf=None, fut=None, s3=None, m1=None, m1_info=None, since=None, h1_history=None):
+    """V22 ⇒ शेवटच्या बंद 15M bar चा निर्णय (dict, decide() चा). m1 = spot 1m (Z-1o) ⇒ V22 df1m (swings2 ⇒ levels + rsi2).
+    m1_info (load_m1 चा payload `m1`) ⇒ m15_complete भरतो / V22 1m सह त्रुटी ⇒ fallback नोंद."""
+    import atp_private.trade_engine.instruments as INS
+    prev = INS._current["name"]
+    INS.set_current(symbol)                                              # PE.guard चा holdout नियम त्याच instrument चा (NIFTY फक्त)
+    try:
+        return _evaluate(symbol, m15, daily, ltf, fut, s3, m1, m1_info, since, h1_history)
+    finally:
+        INS._current["name"] = prev                                      # process-wide instrument पुढच्या caller ला गळू नये
+
+
+def m1_complete(symbol, V, info):
+    """V22 (swings2) नंतर: किती 15M bars चा 1m "complete" (m1_status — ≥ 15 rows, high / low तंतोतंत जुळतात) ⇒ info["m15_complete"].
+    Rows आहेत पण complete 0 ⇒ ⚠️ log + note (1m चे high / low 15M शी जुळत नाहीत ⇒ swings2 1m क्रम कुठेच वापरत नाही)."""
+    if info is None:
+        return
+    res = getattr(V, "res", None)
+    stream = res.get("stream") if isinstance(res, dict) else None
+    if stream is None:
+        return
+    n = sum(1 for x in stream if x.get("m1_status") == "complete")
+    info["m15_complete"] = int(n)
+    if n == 0 and info.get("rows"):
+        note = (f"1m rows {info['rows']} पण complete 0/{info.get('m15_bars')} — 1m चे high / low 15M candles शी जुळत नाहीत "
+                "(वेगळा source / adjustment?) ⇒ swings2 1m क्रम वापरत नाही (परिणाम 1m शिवाय सारखाच)")
+        print(f"⚠️ {str(symbol).upper()} engine3: {note}")
+        info["note"] = f"{info['note']}; {note}" if info.get("note") else note
+
+
+def m1_v22_failed(symbol, info, exc):
+    """V22 1m सह त्रुटी ⇒ 1m शिवाय पुन्हा (1m आवश्यक input नाही ⇒ fail-closed नाही); कारण payload `m1` मध्ये + log."""
+    note = f"V22 1m सह त्रुटी ⇒ 1m शिवाय (जुना मार्ग): {type(exc).__name__}: {str(exc)[:120]}"
+    print(f"⚠️ {str(symbol).upper()} engine3: {note}")
+    if info is not None:
+        info.update(used=False, fallback=True, note=note)
+
+
+def decide_live(V, since=None):
+    """The live decision of one cycle. trigger_tf 15M (or an engine without decide5) ⇒ V.decide(last closed 15M bar) — today's call.
+    trigger_tf 5M (DECISIONS 37) ⇒ V.decide5(last closed 5M candle); `since` (the last stored bar_ts of the session, catch-up — report §5)
+    ⇒ every closed 5M candle of the same session after it is decided too, in order, as r["catch_up"] (a missed cycle never loses a
+    trigger candle; each is read only with what was known at its own close)."""
+    if getattr(V, "trigger_tf", None) != "5M" or not hasattr(V, "decide5"):
+        return attach_next_areas(V, V.decide(len(V.m15) - 1))
+    F = V.trigger_frame()
+    if F.n == 0:
+        raise EngineDataError("5M trigger frame रिकामा ⇒ 5M trigger वाचता येत नाही")
+    last = F.n - 1
+    js = [last]
+    if since is not None:
+        day = pd.Timestamp(F.end[last]).normalize()
+        js = [j for j in range(F.n) if pd.Timestamp(F.end[j]) > pd.Timestamp(since) and pd.Timestamp(F.end[j]).normalize() == day] or [last]
+    rows = [V.decide5(j) for j in js]
+    for x in rows:                                                       # layer 6 (display): the card's next area = the engine's own
+        attach_next_areas(V, x)
+    r = rows[-1]
+    r["catch_up"] = rows[:-1]
+    return r
+
+
+def next_area_of(V, t, e):
+    """Layer 6 output (display only, never read by a decision): the entry's next area in the trade direction — the target, the next
+    opposite area — as the engine reads it at bar t: the nearest alive trade-location area of the opposite role whose near edge lies
+    beyond the entry reference (bear call ⇒ a demand area below, bull put ⇒ a supply area above; BROKEN / DEAD and context-only bands
+    left out). ⇒ {id, tf, role, lo, hi, state} | None (none ahead). Comparison only."""
+    d, ref = int(e["direction"]), float(e["entry_ref"])
+    want = "support" if d < 0 else "resistance"
+    ar = e.get("area") or {}
+    if (getattr(V, "s", None) or {}).get("next_area_rule", "beyond_area") == "beyond_area" and ar.get("lo") is not None:
+        ref = min(ref, float(ar["lo"])) if d < 0 else max(ref, float(ar["hi"]))   # E1: beyond the ENTRY AREA (never overlapping it)
+                                                                           # and beyond the entry itself
+    best, gap = None, None
+    for x in V.levels.snapshot(int(t)):
+        if x.get("role") != want or str(x.get("state") or "").upper() in ("BROKEN", "DEAD") or not x.get("trade_location", True):
+            continue
+        near = float(x["hi"]) if d < 0 else float(x["lo"])
+        g = (ref - near) if d < 0 else (near - ref)
+        if g > 0 and (gap is None or g < gap):
+            best, gap = x, g
+    if best is None:
+        return None
+    return {"id": None if best.get("id") is None else str(best["id"]), "tf": best.get("tf"), "role": want, "lo": float(best["lo"]),
+            "hi": float(best["hi"]), "state": best.get("state")}
+
+
+def visit_bar(V, e, t):
+    """E1 (DECISIONS 66): one visit = one next area — read at the last 15M bar closed when the visit began (its first 5M candle),
+    never later than t; `next_area_rule` entry_ref (what-if) = t."""
+    if (getattr(V, "s", None) or {}).get("next_area_rule", "beyond_area") != "beyond_area":
+        return t
+    try:
+        from atp_private.trade_engine.decision3 import trigger_frame as TF
+        u = (e.get("area") or {}).get("visit_start_bar")
+        if u is None or int(u) < 0 or e.get("trigger_tf") != "5M":
+            return t
+        k = int(TF.of(V).k_of[int(u)])
+        return min(int(t), k) if k >= 0 else t
+    except Exception:                                                     # noqa: BLE001 — display only
+        return t
+
+
+def attach_next_areas(V, r):
+    """Every entry of the row gets e["next_area"] (next_area_of at the row's own 15M bar — the 5M row: its context bar, the last CLOSED
+    15M bar). Display only; an unreadable one is left out (the card then falls back as before). Never raises."""
+    if not isinstance(r, dict):
+        return r
+    t = r.get("context_bar", r.get("bar"))
+    for e in r.get("entries") or []:
+        try:
+            e["next_area"] = next_area_of(V, visit_bar(V, e, t), e)
+        except Exception:                                                 # noqa: BLE001 — display only
+            e.pop("next_area", None)
+        try:
+            e["room"] = room_of(V, e, t)
+        except Exception:                                                 # noqa: BLE001 — display only
+            e.pop("room", None)
+    attach_same_place(r)
+    return r
+
+
+def _place_of(e):
+    """EN3's place of an entry (decision3/engine.V22._place): (its overlapping cluster or its own area, the place's visit)."""
+    if e.get("place"):                                                   # M56 E2: one place across object types (line / area)
+        return ("P", e["place"])
+    cl = e.get("cluster") if isinstance(e.get("cluster"), dict) else {}
+    return (cl.get("id") or f"A{(e.get('area') or {}).get('id')}", e.get("visit_id"))
+
+
+def attach_same_place(r):
+    """M54 V-3 (display only, never a gate): EN3 keeps ONE entry per place per visit; another model that fired on the SAME bar at the
+    same place (the same cluster of overlapping areas, or the same area) became a WATCH ("another entry at this bar") — the kept
+    entry now names it, e["same_place"] = ["E3", …], so its one card / one approval shows the other model as extra evidence. Nothing
+    is re-read; the entries and the watch list stay as the engine wrote them. Never raises."""
+    try:
+        ws = [w for w in (r or {}).get("watch_alerts") or []
+              if isinstance(w, dict) and "another entry at this bar" in str(w.get("watch_why"))]
+        for e in (r or {}).get("entries") or []:
+            pl, m = _place_of(e), str(e.get("model")).upper()
+            same = sorted({str(w.get("model")).upper() for w in ws if _place_of(w) == pl and str(w.get("model")).upper() != m})
+            if same:
+                e["same_place"] = same
+            else:
+                e.pop("same_place", None)
+    except Exception:                                                     # noqa: BLE001 — display only
+        pass
+    return r
+
+
+def room_of(V, e, t):
+    """C2 (owner order 28 Oct; information only, NOT a gate, no R:R rule): at the trigger, the trigger candle's extreme on the trade
+    side against the next opposite area (`e["next_area"]`, read at the visit start) — {reached, room_pts (entry → its near edge)}. The
+    trigger candle = the 5M trigger candle (`trigger_ohlc`) or the 15M bar t. None when no next area is known."""
+    na = e.get("next_area")
+    if not isinstance(na, dict) or na.get("lo") is None or na.get("hi") is None:
+        return None
+    d = int(e["direction"])
+    oh = e.get("trigger_ohlc") if isinstance(e.get("trigger_ohlc"), dict) else None
+    if oh and oh.get("low") is not None and oh.get("high") is not None:
+        lo, hi = float(oh["low"]), float(oh["high"])
+    else:
+        A = V.levels.A
+        lo, hi = float(A["low"][int(t)]), float(A["high"][int(t)])
+    near = float(na["hi"]) if d < 0 else float(na["lo"])                   # bear call: a demand below (its high); bull put: its low
+    reached = (lo <= near) if d < 0 else (hi >= near)
+    ref = e.get("entry_ref")
+    return {"reached": bool(reached), "room_pts": None if ref is None else round(abs(float(ref) - near), 2),
+            "trigger_extreme": round(lo if d < 0 else hi, 2), "near_edge": round(near, 2)}
+
+
+def _evaluate(symbol, m15, daily, ltf, fut, s3, m1=None, m1_info=None, since=None, h1_history=None):
+    from atp_private.trade_engine.decision3 import engine as E3
+    from atp_private.trade_engine.decision3 import history as HI
+    m15 = m15.drop(columns=[c for c in ("volume",) if c in m15.columns])   # index volume 0 ≠ खरा volume (NA हवा)
+    params = v22_kwargs()
+    if fut is not None and "futures" not in params:                      # जुना V22 (futures kwarg नाही) ⇒ joined column
+        m15["volume"] = fut_volume_15m(m15, fut).to_numpy()
+    kw = {"sealed": HI.sealed_fn(symbol)}
+    if s3 is not None:
+        kw["s"] = s3
+    if "ltf" in params and ltf is not None:
+        kw["ltf"] = ltf
+    if "futures" in params and fut is not None:
+        kw["futures"] = fut
+    if "h1_history" in params and h1_history is not None:                # M56 E1: as the tested reader (DECISIONS 98)
+        kw["h1_history"] = h1_history
+
+    def run(df1m):
+        with fold_cache(symbol.upper()):
+            V = E3.V22(m15, df1m, daily, **kw)
+        return V, decide_live(V, since)
+    if m1 is None:
+        return run(None)[1]
+    try:
+        V, r = run(m1)
+    except Exception as exc:                                             # noqa: BLE001 — 1m मुळे fail-closed नाही: एकदा 1m शिवाय
+        m1_v22_failed(symbol, m1_info, exc)
+        return run(None)[1]
+    m1_complete(symbol, V, m1_info)
+    return r
+
+
+TRADEABLE_STATES = ("ACTIVE", "TESTED", "FLIPPED")                         # BROKEN / DEAD (किंवा अज्ञात) ⇒ pre-open मध्ये नाही
+
+
+def tradeable_levels(levels):
+    """फक्त trade करता येणारे पट्टे: `state` field असेल (decision3 #325 नंतर) ⇒ ACTIVE / TESTED / FLIPPED ठेवा, BROKEN / DEAD (अज्ञात) वगळा;
+    field नसेल (main: snapshot फक्त जिवंत levels देतो) ⇒ सगळे ठेवा. Abhi Z-1u: `trade_location` False (Weekly context; Daily पट्टा 1H zone
+    ने झाकलेला) ⇒ वगळा — प्रत्येक timeframe चा स्वतःचा पट्टा, confluence फक्त label (`confluence_label`)."""
+    return [x for x in levels or [] if (x.get("state") is None or str(x["state"]).upper() in TRADEABLE_STATES)
+            and x.get("trade_location", True)]
+
+
+def watched_levels(symbol, feed, now, s=None, keep=None):
+    """Pre-open (Abhi): engine (V22 ② Levels) चे शेवटच्या बंद 15M bar ला जिवंत levels — [{"role", "lo", "hi", …}] (`Levels.snapshot`).
+    पट्टे swing / base candles वरून (TA4, lo < hi). 15M + Daily (+ 1m, live `compute` सारखंच — Z-1o: s = `ES.engine3_settings(sym)`,
+    `engine3_use_1m` False ⇒ 1m मागवत नाही) पुरे (levels ला LTF / FUT लागत नाही ⇒ c1 इशारा दाबला). 1m नाही / V22 1m सह त्रुटी ⇒ 1m
+    शिवाय (कारण log). Data नाही ⇒ EngineDataError (caller NA + कारण). keep (dict) ⇒ keep["V"] = तोच V22 (pre-open charts तोच data
+    वापरतात — पुन्हा fetch / build नाही); None ⇒ जुनंच."""
+    import contextlib
+    import io
+    import warnings
+    import atp_private.trade_engine.instruments as INS
+    from atp_private.trade_engine.decision3 import engine as E3
+    from atp_private.trade_engine.decision3 import history as HI
+    s3 = v22_settings(s)                                                 # live compute सारखेच V22 settings (swing scale + layer switches); bad ⇒ raise
+    m15, daily, _l, _f, _n = build_inputs(feed, symbol, now, s, levels_only=True)
+    m1, info = load_m1(feed, symbol, m15, pd.Timestamp(now), s)           # live compute सारखाच 1m ⇒ pre-open = engine चे पट्टे
+    h1h, _h1i = h1_history_of(feed, symbol, m15, pd.Timestamp(now), s, full=True)   # M56 E1: the live 1H history (pre-open: fill all)
+    m15 = m15.drop(columns=[c for c in ("volume",) if c in m15.columns])
+    prev = INS._current["name"]                                          # before the process-wide instrument changes
+    INS.set_current(symbol)
+
+    def build(df1m):
+        with fold_cache(symbol.upper()), warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+            warnings.simplefilter("ignore")
+            return E3.V22(m15, df1m, daily, sealed=HI.sealed_fn(symbol), **({"s": s3} if s3 else {}),
+                          **({"h1_history": h1h} if h1h is not None else {}))
+    try:
+        if m1 is None:
+            V = build(None)
+        else:
+            try:
+                V = build(m1)
+            except Exception as exc:                                     # noqa: BLE001 — 1m मुळे NA नाही: एकदा 1m शिवाय
+                m1_v22_failed(symbol, info, exc)
+                V = build(None)
+            else:
+                m1_complete(symbol, V, info)
+    finally:
+        INS._current["name"] = prev
+    if keep is not None:
+        keep["V"] = V
+        try:                                                             # A1 (28 Oct): the pre-open's trend = the engine's own step ①
+            keep["trend"] = engine_trend_ctx(V)
+        except Exception as exc:                                         # noqa: BLE001 — the caller falls back (and says so)
+            keep["trend_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+    t = len(V.m15) - 1
+    lv = tradeable_levels(V.levels.snapshot(t))
+    try:                                                                 # P1 (owner order 30 Oct (7)): the engine's own watch list
+        from atp_private.trade_engine.decision3 import chart_reading as CR                       # (step ②, the row's watch_list) rides on the payload —
+        CR.stamp_watch(lv, CR.engine_watch_list(V, t))                   # the pre-open card reads its areas / order from it
+    except Exception as exc:                                             # noqa: BLE001 — no stamp ⇒ the card says NA + why
+        print(f"⚠️ {symbol} engine watch list: {type(exc).__name__}: {str(exc)[:120]}")
+    return lv
+
+
+def engine_trend_ctx(V, t=None):
+    """A1 (owner order 28 Oct): the Daily side the ENGINE trades at bar t (default: the last closed 15M bar) in the level-bot trend
+    context shape (`level_reaction.context_from_state`): {ok, trend, sides, band, protected, reason, source = "engine"}. SW3 (the
+    default `daily_side_rule`): UP / DOWN from the final external Daily swings, protected = the swing the engine protects (the swing
+    behind the latest BOS); TRANSITION / RANGE ⇒ range rules (both edges, the band). The impulse fold only under `daily_side_rule =
+    impulse` (what-if) — the same step ① the engine decides with, so the pre-open never shows a different trend."""
+    from atp_private.trade_engine.bots_common import level_reaction as LR
+    t = len(V.m15) - 1 if t is None else int(t)
+    ok, why, st, ctx = V.step1(t)
+    sw = ctx.get("sw") or {}
+    tr = str(ctx.get("trend") or "UNKNOWN")
+    band = ctx.get("band") or (st.band if tr == "RANGE" else None)
+    prot = sw.get("protect") if sw else (None if st.protected is None else st.protected.price)
+    out = {"ok": bool(ok) and tr in ("UP", "DOWN", "RANGE") and (tr != "RANGE" or bool(band)), "trend": tr,
+           "sides": {LR.BULL} if tr == "UP" else {LR.BEAR} if tr == "DOWN" else {LR.BULL, LR.BEAR} if tr == "RANGE" else set(),
+           "band": None if not band else (float(band[0]), float(band[1])), "protected": None if prot is None else round(float(prot), 2),
+           "phase": None, "counter": None, "origin_risk": False, "mature": False, "structure_against": False, "source": "engine",
+           "daily_trend": ctx.get("daily_trend") or tr, "reason": why}
+    if not out["ok"]:
+        out["sides"] = set()
+    return out
+
+
+def _first_fail(chk):
+    for k, v in (chk or {}).items():
+        if v and v[0] is False:
+            return k, str(v[1])
+    return None, None
+
+
+def _flip_ctx(g):
+    """G4 approach context (Abhi Z-1d: context only) ⇒ payload."""
+    if not g:
+        return None
+    return {"a": g.get("a"), "b": g.get("b"), "why": g.get("why"), "b_ratio": (g.get("b_read") or {}).get("ratio"),
+            "a_form": (g.get("a_read") or {}).get("form")}
+
+
+def _zone_sum(z):
+    """In-zone study summary ⇒ payload (candles वगळून; RSI divergence सह)."""
+    if not z:
+        return None
+    sm = dict(z.get("summary") or {})
+    sm.pop("commit_bar", None)
+    return {"from": z.get("from"), "to": z.get("to"), **sm}
+
+
+def row_from_v22(symbol, r, now_fn):
+    """V22 decide dict ⇒ engine_signal store row (decision2 च्याच columns ⇒ adapter / bots बदलत नाहीत)."""
+    lv = r.get("level") or {}
+    rk = r.get("risk") or {}
+    d = None
+    if lv.get("role") in ("support", "resistance"):
+        d = 1 if lv["role"] == "support" else -1
+    gate, why = _first_fail(r.get("checklist"))
+    reason = r.get("why") or why or ""
+    payload = {"engine": "decision3", **{k: r.get(k) for k in ("ts", "bar_end", "daily_trend", "trend_used", "trend_resolution",
+                                                            "weekly_trend", "daily_phase", "mature", "trend_notes", "trend_cap",
+                                                            "mark", "conviction", "commitment_form", "missing", "checklist", "volume_note",
+                                                            "m1")},
+               "level": {k: lv.get(k) for k in ("id", "tf", "role", "lo", "hi", "births", "sweeps", "dist", "state", "broken_ts", "far_swing",
+                                                "flipped_ts", "confluence_label", "false_break_extremes")} if lv else None,   # Z-1u;
+               # DECISIONS 89: the extremes made while price tested the object, labelled "FALSE BREAK extreme" (never a swing)
+               "risk": rk or None, "flip_context": _flip_ctx(r.get("flip_retest")), "zone_read": _zone_sum(r.get("zone_read")),
+               "data_problem": (r.get("commit") or {}).get("data_problem"), "volume_measure": r.get("volume_measure"),
+               "range_state": r.get("range_state"), "watch_list": r.get("watch_list"), "reader": reader_facts(r),
+               "bar_ohlc": r.get("bar_ohlc"), "bar_revision": r.get("bar_revision")}   # M56 E3: the trigger bar (+ its revision)
+    if "entries" in r:                                                   # entry models E1–E4 (decision data — fit_payload never drops them)
+        payload["entries"] = compact_entries(r.get("entries"))
+        payload["armed"] = compact_armed(r.get("armed"))
+        if r.get("legacy_k_gate") is not None:                           # old step ③: a logged diagnostic only (first to go when too long)
+            payload["legacy_k_gate"] = r.get("legacy_k_gate")
+    if isinstance(r.get("model_c"), dict):                               # model C on (DECISIONS 32): the cycle in one line (display)
+        cy = r["model_c"].get("cycle") or {}
+        payload["model_c"] = {"phase": cy.get("phase"), "cycle": cy.get("id"), "why": str(cy.get("why") or r["model_c"].get("why")
+                                                                                         or "")[:200],
+                              "windows": cy.get("windows"), "entries": r["model_c"].get("entries"), "error": r["model_c"].get("error")}
+    return {"symbol": str(symbol).upper(), "bar_ts": str(pd.Timestamp(r["bar_end"])), "computed_at": str(now_fn()),
+            "decision": r.get("decision"), "gate": gate, "direction": d, "level_lo": lv.get("lo"), "level_hi": lv.get("hi"),
+            "entry": rk.get("entry"), "invalidation": rk.get("sl"), "target": rk.get("target"), "grade": r.get("conviction"),
+            "reason": str(reason)[:300], "payload": fit_payload(payload)}
+
+
+def reader_facts(r):
+    """Approval card summary (setting `approval_card_layout`, display only): the reading's own facts COPIED from the V22 row — the
+    layer 6a evidence list (required set present / absent, confirming pieces present / absent / NA), ① trend and ③ area as the
+    checklist read them, the handover's form (sharp_reversal = the fast two-candle form) and the LTF label of the CHoCH. Nothing is
+    re-read or scored; a missing fact stays None. Never raises (a display field never blocks a row)."""
+    try:
+        chk = r.get("checklist") or {}
+        cm = r.get("commit") or {}
+
+        def first(k):
+            v = chk.get(k)
+            return None if not isinstance(v, (list, tuple)) or not v or v[0] is None else bool(v[0])
+        return {"evidence_list": r.get("evidence_list"), "trend": first("①"), "area": first("③"),
+                "handover_form": (cm.get("handover_state") or {}).get("form"), "ltf": (cm.get("choch") or {}).get("label")}
+    except Exception:                                                    # noqa: BLE001 — display only
+        return None
+
+
+ENTRY_KEYS = ("model", "name", "direction", "side", "object", "visit_id", "visit_start", "key", "trigger_ts", "trigger_bar_end",
+              "entry_ref", "evidence", "evidence_list", "label")
+AREA_KEYS = ("id", "tf", "role", "lo", "hi", "state", "object", "broken_at")   # broken_at: E4 (b)'s break candle (V4 mark)
+ARMED_MODEL_KEYS = ("status", "at", "waiting", "note")
+
+
+def _area_of(a):
+    return {k: a.get(k) for k in AREA_KEYS if k in a or k in ("id", "tf", "lo", "hi", "state")} if isinstance(a, dict) else None
+
+
+def _invalidation_of(e):
+    """decision3 (H1) gives `invalidation` = the price and `invalidation_rule` = its text (separate keys); a dict {price, rule} is read
+    the same way. ⇒ {"price": float | None, "rule": str | None} (card: information only — the trade's SL / target are the dashboard's)."""
+    inv = e.get("invalidation")
+    if isinstance(inv, dict):
+        px, rule = inv.get("price"), inv.get("rule")
+    else:
+        px, rule = inv, None
+    rule = e.get("invalidation_rule") if rule is None else rule
+    try:
+        px = None if px is None else float(px)
+    except (TypeError, ValueError):
+        px = None
+    return {"price": px if px == px else None, "rule": None if rule is None else str(rule)}
+
+
+def _cluster_of(c):
+    """decision3 `entry_cluster_rule = cluster`: the overlapping cluster an entry stands for ⇒ {id, anchor, visit_id, n, members
+    [{area_id, tf, lo, hi, state}]} (ids as text). Abhi 21 Oct (Z-1u): the cluster only COUNTS one signal per model per place — it has
+    no band of its own (the entry's zone = its own visited area, `area`). Not a dict ⇒ None."""
+    if not isinstance(c, dict):
+        return None
+    txt = lambda v: None if v is None else (v if isinstance(v, (str, int, float)) and not isinstance(v, bool) else str(v))  # noqa: E731
+    num = lambda v: None if v is None else float(v)  # noqa: E731
+    try:
+        return {"id": txt(c.get("id")), "anchor": txt(c.get("anchor")),
+                "visit_id": None if c.get("visit_id") is None else str(c["visit_id"]), "n": int(c.get("n") or 0),
+                "members": [{"area_id": txt(m.get("area_id")), "tf": m.get("tf"), "lo": num(m.get("lo")), "hi": num(m.get("hi")),
+                             "state": m.get("state")} for m in (c.get("members") or []) if isinstance(m, dict)]}
+    except (TypeError, ValueError):
+        return None
+
+
+def compact_entries(entries):
+    """decision3 `entries` (fired entry models of this bar) ⇒ the contract fields only (model, name, direction, side, object, area {id,
+    tf, role, lo, hi, state, object}, visit_id, visit_start, key, trigger_ts, trigger_bar_end, entry_ref, invalidation {price, rule},
+    evidence ([name, mark] pairs), evidence_list (the 6a dict), label); timestamps as text. Not a list ⇒ []. A non-dict item is skipped.
+    Nothing is re-read or scored."""
+    out = []
+    for e in entries if isinstance(entries, (list, tuple)) else []:
+        if not isinstance(e, dict):
+            continue
+        x = {k: e.get(k) for k in ENTRY_KEYS}
+        x["area"] = _area_of(e.get("area"))
+        x["invalidation"] = _invalidation_of(e)
+        if e.get("cluster") is not None:                                 # one location = the overlapping cluster (its member areas)
+            x["cluster"] = _cluster_of(e.get("cluster"))
+        if e.get("place"):                                               # M56 E2: one place across object types (siblings / EN3)
+            x["place"] = str(e["place"])
+        rb = e.get("refined_base")
+        if isinstance(rb, dict) and rb.get("lo") is not None:            # RC2: the refined 15M base inside the area (display + card)
+            x["refined_base"] = {"lo": float(rb["lo"]), "hi": float(rb["hi"]), "ts": None if rb.get("ts") is None else str(rb["ts"])}
+        if e.get("trigger_tf"):                                          # DECISIONS 37: the 5M trigger candle (card / audit / replay)
+            x["trigger_tf"] = str(e["trigger_tf"])
+            x["trigger"] = trigger_of(e)
+        if isinstance(e.get("room"), dict):                              # C2: the room fact (information only)
+            x["room"] = dict(e["room"])
+        if isinstance(e.get("same_place"), list) and e["same_place"]:    # M54 V-3: the EN3 same-bar same-place models (evidence)
+            x["same_place"] = [str(m) for m in e["same_place"]]
+        if "next_area" in e:                                             # layer 6: the target as the engine reads it (display; None = none)
+            na = e.get("next_area")
+            x["next_area"] = None if not isinstance(na, dict) else {k: (str(na[k]) if k == "id" and na.get(k) is not None else na.get(k))
+                                                                     for k in ("id", "tf", "role", "lo", "hi", "state")}
+        pa = pa_first_per_track(e.get("pa_evidence"))
+        if pa:                                                           # T9: the PA evidence (display only) — first fact per track
+            x["pa_evidence"] = pa
+        if e.get("family") == "C":                                       # model C (DECISIONS 32): family, sub-model, story, context
+            x.update(model_c_of(e))
+        elif isinstance(e.get("model_c_context"), dict):                 # C-f: a label on a Daily-side entry (statistics only)
+            x["model_c_context"] = {"sub_model": e["model_c_context"].get("sub_model"), "cycle": e["model_c_context"].get("cycle")}
+        for k in ("trigger_ts", "visit_id", "visit_start", "trigger_bar_end", "key"):
+            if x.get(k) is not None:
+                x[k] = str(x[k])
+        if x["area"] is not None and x["area"].get("id") is not None and not isinstance(x["area"]["id"], (str, int, float)):
+            x["area"]["id"] = str(x["area"]["id"])                       # numpy ints ⇒ text, never a JSON error
+        out.append(x)
+    return out
+
+
+TRIGGER_FACTS = ("line", "at", "choch_level", "sweep_ts", "sweep_extreme", "push_ts", "push_price", "form", "retest_extreme")
+
+
+def trigger_of(e):
+    """A 5M-trigger entry (DECISIONS 37) ⇒ {tf, ts, bar_end, ohlc, volume, context_bar_ts, bar15_ts, visit_start5, facts (CHoCH / sweep
+    / push / form), line_values [[ts, price]] (E4 b on a line: the line's value at the visit's 5M candles)}. Display / audit only; never
+    raises."""
+    try:
+        f = e.get("facts") if isinstance(e.get("facts"), dict) else {}
+        oh = e.get("trigger_ohlc") if isinstance(e.get("trigger_ohlc"), dict) else {}
+        num = lambda v: None if v is None else float(v)  # noqa: E731
+        txt = lambda v: None if v is None else str(v)  # noqa: E731
+        out = {"tf": txt(e.get("trigger_tf")), "ts": txt(e.get("trigger_ts")), "bar_end": txt(e.get("trigger_bar_end")),
+               "ohlc": {k: num(oh.get(k)) for k in ("open", "high", "low", "close")} if oh else None,
+               "volume": num(e.get("trigger_volume")), "context_bar_ts": txt(e.get("context_bar_ts")),
+               "bar15_ts": txt(e.get("trigger_bar15_ts")), "visit_start5": txt(e.get("visit_start5")),
+               "facts": {k: (f[k] if isinstance(f[k], (int, float, str)) or f[k] is None else str(f[k])) for k in TRIGGER_FACTS if k in f}}
+        if isinstance(e.get("line_values"), list):
+            out["line_values"] = [[str(a), float(b)] for a, b in e["line_values"][-36:]]
+        return out
+    except Exception:                                                    # noqa: BLE001 — display only
+        return {"tf": str(e.get("trigger_tf"))}
+
+
+def pa_first_per_track(rows):
+    """T9 (decision3/pa_evidence rows) ⇒ the payload's compact list: the first row of each track ({track, tf, text}), in the reader's
+    order. Display only — the full list stays on the decision3 entry. Not a list ⇒ []."""
+    out, seen = [], set()
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and r.get("track") and r.get("text") and r["track"] not in seen:
+            seen.add(r["track"])
+            out.append({"track": str(r["track"]), "tf": None if r.get("tf") is None else str(r["tf"]), "text": str(r["text"])})
+    return out
+
+
+def model_c_of(e):
+    """A model C entry's card / audit facts (decision3/model_c.py label) ⇒ {family, sub_model, story, model_c {window, daily, weekly, O,
+    choch, HA, B, a_nature, b_nature, end_zone, invalidated_if}} with plain values (prices, words). Display + audit only; never raises."""
+    try:
+        c = e.get("model_c") if isinstance(e.get("model_c"), dict) else {}
+        pt = lambda p: None if not isinstance(p, dict) else {k: p.get(k) for k in ("price", "level", "ts") if k in p}   # noqa: E731
+        nat = lambda n: None if not isinstance(n, dict) else {"verdict": n.get("verdict"), "why": str(n.get("why") or "")[:160]}  # noqa: E731
+        ez = c.get("end_zone") if isinstance(c.get("end_zone"), dict) else {}
+        return {"family": "C", "sub_model": e.get("sub_model"), "story": None if e.get("story") is None else str(e["story"])[:400],
+                "model_c": {"window": c.get("window"), "daily": c.get("daily"), "weekly": c.get("weekly"), "O": pt(c.get("O")),
+                            "choch": pt(c.get("choch")), "HA": pt(c.get("HA")), "B": pt(c.get("B")),
+                            "a_nature": nat(c.get("a_nature")), "b_nature": nat(c.get("b_nature")),
+                            "end_zone": {"first_htf_area": ez.get("first_htf_area"), "protected_origin": ez.get("protected_origin"),
+                                         "projections": ez.get("projections")},
+                            "invalidated_if": c.get("invalidated_if")}}
+    except Exception:                                                    # noqa: BLE001 — display only
+        return {"family": "C", "sub_model": e.get("sub_model")}
+
+
+def compact_armed(armed):
+    """decision3 `armed` (per armed area: each model's status — fired / fired_earlier / waiting / passed / off / disarmed …) ⇒ compact:
+    scalars and lists of scalars kept, a nested area reduced to {id, tf, lo, hi, state}, the per-model status dict `models` kept as
+    {model: {status, at, waiting (≤ 160 chars), note}}, anything else dropped. Not a list ⇒ []."""
+    def scalar(v):
+        return v is None or isinstance(v, (str, int, float, bool))
+    out = []
+    for a in armed if isinstance(armed, (list, tuple)) else []:
+        if not isinstance(a, dict):
+            continue
+        x = {}
+        for k, v in a.items():
+            if k == "area":
+                x[k] = _area_of(v)
+            elif k == "models" and isinstance(v, dict):
+                x[k] = {str(m): {kk: (str(st.get(kk))[:160] if kk in ("waiting", "note") and st.get(kk) is not None else st.get(kk))
+                                 for kk in ARMED_MODEL_KEYS if kk in st} for m, st in v.items() if isinstance(st, dict)}
+            elif scalar(v):
+                x[k] = v
+            elif isinstance(v, (list, tuple)) and all(scalar(i) for i in v):
+                x[k] = list(v)
+            elif hasattr(v, "isoformat"):
+                x[k] = str(v)
+            elif isinstance(v, (np.integer, np.floating)):
+                x[k] = v.item()
+        out.append(x)
+    return out
+
+
+PAYLOAD_MAX = 20000
+_PAYLOAD_DROP = ("legacy_k_gate", "checklist", "zone_read", "watch_list", "flip_context", "trend_notes", "level", "risk")   # bulky first;
+_PAYLOAD_KEEP = ("entries", "armed", "bar_ohlc", "bar_revision")         # never data_problem / entries / armed (decision data);
+                                                                          # M56 E3: the trigger bar's OHLC (the next cycle compares it)
+
+
+def fit_payload(payload, limit=PAYLOAD_MAX):
+    """Payload JSON ≤ limit chars WITHOUT a blind cut (a cut string is invalid JSON ⇒ the data_problem flag would be lost): drop the
+    bulky context keys one by one (noted in "dropped"); still too long ⇒ only the flags (engine, data_problem, volume_measure) + the
+    entry models (`entries`, `armed` — decision data, never dropped; the limit is a size target, not a hard cut)."""
+    dump = lambda d: json.dumps(d, ensure_ascii=False, default=str)  # noqa: E731
+    out = dump(payload)
+    if len(out) <= limit:
+        return out
+    if any(isinstance(e, dict) and "pa_evidence" in e for e in payload.get("entries") or ()):   # T9 PA evidence: display only, the
+        payload = {**payload, "entries": [{k: v for k, v in e.items() if k != "pa_evidence"} if isinstance(e, dict) else e
+                                          for e in payload["entries"]]}   # removed first (review), then "reader": today's payload kept
+        out = dump(payload)
+        if len(out) <= limit:
+            return out
+    if "reader" in payload:                                              # display-only reader facts (approval card summary): too
+        payload = {k: v for k, v in payload.items() if k != "reader"}     # long ⇒ removed SILENTLY, so the rest is exactly today's
+        out = dump(payload)                                              # payload (no longer "dropped" list, no extra key pushed out)
+        if len(out) <= limit:
+            return out
+    p, dropped = dict(payload), []
+    for k in _PAYLOAD_DROP:
+        if k in p:
+            p.pop(k)
+            dropped.append(k)
+            out = dump({**p, "dropped": dropped})
+            if len(out) <= limit:
+                return out
+    keep = {k: payload.get(k) for k in ("engine", "ts", "bar_end", "data_problem")}
+    keep["volume_measure"] = str(payload.get("volume_measure") or "")[:500]
+    keep.update({k: payload[k] for k in _PAYLOAD_KEEP if k in payload})  # entry models: decision data, never trimmed away
+    return dump({**keep, "dropped": "all context (payload too large)"})
+
+
+def compute(symbol, feed, now, s=None, since=None, prev_bar=None):
+    """One cycle. prev_bar (M56 E3: the previous stored trigger bar, engine_signal.prev_trigger_bar) ⇒ when this fetch shows that bar
+    revised by Upstox, it is re-decided once in this same cycle (since moves before it; its row is replaced, payload `bar_revision`)
+    and the revision is logged. Every decided row carries its trigger bar's OHLC (`bar_ohlc`) for the next cycle's comparison."""
+    s3 = v22_settings(s)                                                 # dashboard swing scale + layer switches; bad ⇒ raise before any fetch
+    m15, daily, ltf, fut, note = build_inputs(feed, symbol, now, s)
+    frame = ltf if trigger_tf_of(s) == "5M" else m15
+    rev = bar_revision(prev_bar, frame)
+    if rev is not None:                                                  # 5M: re-decided by the catch-up; 15M (what-if): logged only
+        print(f"🔁 {str(symbol).upper()} engine3: the trigger bar {pd.Timestamp(rev['bar_ts']):%H:%M} was revised by Upstox "
+              f"(stored {rev['stored']} ⇒ fetched {rev['fetched']}) ⇒ " + ("re-decided once" if frame is ltf else "logged (15M: no catch-up)"))
+        if frame is ltf:                                                 # 5M: the catch-up decides from the revised bar on
+            back = pd.Timestamp(rev["bar_ts"]) - (pd.Timestamp(ltf["bar_end"].iloc[-1]) - pd.Timestamp(ltf["timestamp"].iloc[-1]))
+            since = back if since is None else min(pd.Timestamp(since), back)
+    m1, m1_info = load_m1(feed, symbol, m15, pd.Timestamp(now), s)
+    h1h, h1_info = h1_history_of(feed, symbol, m15, pd.Timestamp(now), s)
+    r = evaluate(symbol, m15, daily, ltf, fut, s3=s3, m1=m1, m1_info=m1_info, since=since, h1_history=h1h)
+    for x in [r] + list(r.get("catch_up") or []):
+        if x.get("bar_end") is not None:
+            x["bar_ohlc"] = bar_ohlc(frame, x["bar_end"])
+            if rev is not None and pd.Timestamp(x["bar_end"]) == pd.Timestamp(rev["bar_ts"]):
+                x["bar_revision"] = rev
+    r["h1_history"] = h1_info                                            # M56 E1: the stored 1H history used (or why not)
+    r["volume_note"] = note
+    r["m1"] = m1_info                                                    # Z-1o: 1m वापरला का / fallback कारण (row payload)
+    return r
