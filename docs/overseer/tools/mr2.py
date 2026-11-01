@@ -1,0 +1,10 @@
+MR={
+"L01":("SWEEP / retest — जिवंत (support)","11 Sep 10:15 ला आत परत; पुढचा Daily swing low 53,027 कधीच नाही","gap ने खाली close, पण पुढच्या Daily swing low (53,027) पर्यंत धाव नाही, थेट आत परत ⇒ break नाही. Reader चा 11 Sep 10:15 चा E4(b) bear call नसायलाच हवा."),
+"L02":("SWEEP / retest — जिवंत (support)","पुढचा Daily swing 53,027 कधीच नाही","15–16 Sep खाली closes, lows 55,795 / 55,812 — पुढच्या swing पासून खूप लांब; 16 Sep ला वर परत ⇒ sweep."),
+"L03":("28 Sep लाच BROKEN (24 Sep ला नाही) ⇒ मग resistance मध्ये FLIP","28 Sep 09:15 ला कळलं; 24–27 Sep = 'पलीकडे, पण broken नाही'","24 Sep खाली close आणि खालीच, पण पुढचा 1H swing low 55,097.6 फक्त 28 Sep ला गाठला. तोपर्यंत flip entry नाही ⇒ 25 Sep चा E4(b) bear call = नाही. 28 Sep 09:15 पासून flipped resistance."),
+"L04":("SWEEP / retest — flip अजून जिवंत","पुढचा 1H swing high 56,623.8 कधीच नाही","15 Oct वर closes (high 56,066), पण पुढचा swing 56,623.8 गाठला नाही, price परत ⇒ flip चा retest; dead नाही."),
+"L05":("17 Jul 15:15 BROKEN → 20 Jul 09:15 DEAD","broken 17 Jul 15:15 ला; dead 20 Jul 09:15 ला","17 Jul वर close + पुढचा 1H swing high 58,581.1 गाठला ⇒ broken (support मध्ये flip). 20 Jul gap ने खाली + पुढचा 1H swing low 57,916.1 गाठला ⇒ broken back ⇒ DEAD. टीप: break 17 Jul च्या शेवटच्या 15M bar वर आहे. 20 Jul 14:15 चा E4(b) = नाही."),
+"L06":("26 Aug 09:15 BROKEN (support मध्ये flip) → 31 Aug 09:15 DEAD","broken 26 Aug 09:15; dead 31 Aug 09:15 (28 Aug नाही)","26 Aug gap candle वर close आणि पुढचा 1H swing high 57,873.8 पार ⇒ broken. 27–28 Aug खाली closes, पण पुढचा 1H swing low 57,251.6 फक्त 31 Aug ला ⇒ तेव्हा DEAD. 26 Aug 09:15 नंतर या band वर bear call नाही (E26 चा 09:20 E1 दुसऱ्या band वर, 57,738–57,964)."),
+"L07":("3 वेळा SWEEP — resistance जिवंत; एकच object","पुढचा 1H swing high 56,996.4 कधीच नाही","21–23 Sep वर 17 closes, highs 56,668 / 56,671 / 56,624 — पुढच्या swing 56,996 च्या जवळपासही नाहीत ⇒ retest/sweep. एक band = एक id."),
+"L08":("SWEEP — Weekly support जिवंत (broken नाही)","पुढचा Weekly swing low 52,783 कधीच नाही","28–29 Sep खाली closes, low 53,786, पण पुढचा Weekly swing 52,783 गाठला नाही; October मध्ये आत परत ⇒ break नाही. 1,207 pt band रुंदी हा वेगळा मुद्दा."),
+}
