@@ -181,7 +181,85 @@ Tested in the session (1 Nov) against trade-data with a temporary store (`STORE=
 - An extra file: "unlisted file(s)", exit 1.
 - A source branch with one corrupted byte: "sha256 mismatch", exit 1, the store stays empty.
 
+Re-tested 1 Nov in the T1-T6 session the same way (REPO = the trade-data GitHub remote, temporary STORE): first run
+188 / 188 verified, installed, OK; second run "nothing to do"; one byte flipped in an installed file: "sha256 mismatch",
+exit 1, left untouched; an extra file: exit 1; a source branch whose one file has a flipped byte: "sha256 mismatch",
+exit 1, the store holds no snapshot folder.
+
 Open point (default used): the store path is `/opt/atp/private_fixtures` until the owner names another one.
 `ATP_PRIVATE_FIXTURES` and `BACKUP_EXTRA_DIRS` in `/opt/atp/.env` are set later by an `atp.sh` PR (W9), not here.
 
+## W5 host install block - the owner runs this ONE block on the ATP host, as root
+
+What it does (Analyze a chart / Copilot "Analyze my chart" on production):
+1. Makes the host's read-only deploy key `~/.ssh/atp_private_ro` for the `atp` user, only if it does not exist yet.
+2. Checks with `git ls-remote` that the key can read `atp-private`. If not, it stops (exit 2) and prints the public
+   half: paste it in atp-private -> Settings -> Deploy keys -> Add deploy key, "Allow write access" unticked; then run
+   the block again.
+3. Sets `ATP_PRIVATE_REF=ec152c9d331e5ba8ea135be1c6179be55c716112` in `/opt/atp/.env` (the reviewed atp-private main commit: the Analyze-a-chart shim
+   on engine-snapshot-v2). A backup of `.env` is kept once as `.env.bak-m79`. Nothing else in `.env` changes.
+4. Runs `atp.sh deploy` twice, then `atp.sh health`. The first deploy brings the `atp.sh` that can fetch by commit sha
+   (ATP PR #857, which must be merged first); the second converges on the same release and fetches the private
+   package into `/opt/atp/private` (read-only mount into the backend and the worker). It stops if `atp.sh` still
+   cannot fetch by sha.
+- Idempotent: a second run changes nothing (same key, same ref, deploy converges).
+- What changes on the host: the key file pair (if new), one line in `.env`, the checkout `/opt/atp/private`, the
+  backend and worker containers recreated on the new mount. No database migration, no flag, no order path.
+- It runs in the background as `atp`. The last line of the log is `RESULT: OK` or `RESULT: FAILED (exit N)`.
+
+```bash
+cat > /tmp/atp-m79-engine.sh <<'ATPEOF'
+#!/usr/bin/env bash
+# M79 W5: the private package at a reviewed atp-private commit for Analyze a chart, then deploy + health.
+set -euo pipefail
+REF=ec152c9d331e5ba8ea135be1c6179be55c716112
+ENVF="${ENVF:-/opt/atp/.env}"
+ATP="${ATP:-/opt/atp/deploy/atp.sh}"
+KEY="${KEY:-$HOME/.ssh/atp_private_ro}"
+REPO="${REPO:-git@github.com:abhishekwasu-hue/atp-private.git}"
+say() { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+trap 'rc=$?; [ $rc -eq 0 ] && say "RESULT: OK" || say "RESULT: FAILED (exit $rc)"' EXIT
+[ "$(id -un)" = atp ] || [ -n "${ALLOW_ANY_USER:-}" ] || { say "STOP: run as the atp user"; exit 1; }
+[ -f "$ENVF" ] || { say "STOP: $ENVF not found"; exit 1; }
+if [ ! -f "$KEY" ]; then
+  mkdir -p "$(dirname "$KEY")" && chmod 700 "$(dirname "$KEY")"
+  ssh-keygen -q -t ed25519 -f "$KEY" -N "" -C "atp host read-only"
+  say "made the read-only deploy key $KEY"
+fi
+if ! GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new" \
+     GIT_TERMINAL_PROMPT=0 git ls-remote -q "$REPO" HEAD >/dev/null 2>&1; then
+  say "STOP: the key cannot read atp-private yet. Add this PUBLIC key in atp-private -> Settings -> Deploy keys"
+  say "      -> Add deploy key ('Allow write access' unticked), then run this block again:"
+  cat "$KEY.pub"
+  exit 2
+fi
+say "deploy key reads atp-private: OK"
+[ -e "$ENVF.bak-m79" ] || cp -p "$ENVF" "$ENVF.bak-m79"
+if grep -q '^ATP_PRIVATE_REF=' "$ENVF"; then sed -i "s|^ATP_PRIVATE_REF=.*|ATP_PRIVATE_REF=$REF|" "$ENVF"
+else printf '\nATP_PRIVATE_REF=%s\n' "$REF" >> "$ENVF"; fi
+say "ATP_PRIVATE_REF=$REF in $ENVF"
+"$ATP" deploy
+grep -q 'kind="commit"' "$ATP" || { say "STOP: this atp.sh cannot fetch by commit sha yet (ATP PR #857 not merged)"; exit 3; }
+"$ATP" deploy
+"$ATP" health || say "health reported a warning or a problem (see the lines above)"
+ATPEOF
+chown atp /tmp/atp-m79-engine.sh && su - atp -c "nohup bash /tmp/atp-m79-engine.sh > /tmp/atp-m79-engine.log 2>&1 &"
+```
+After about ten minutes: `grep -E 'chart analysis engine|trade engine|RESULT' /tmp/atp-m79-engine.log`.
+
+Expected: `chart analysis engine source at commit ec152c9...`, then in health `chart analysis engine: OK
+(atp-trade-engine engine-snapshot-v2+813358b)` and `trade engine: MISSING (the engine failed to start
+(EngineNotImported))` (the signal-engine shim EN-1 is not built; its flag stays OFF).
+
+Tested locally with fakes (a fake atp.sh that records its calls, a local bare repository for atp-private, a stub
+ssh-keygen, a temporary .env): no access -> exit 2, the public half printed, the private half never, .env untouched;
+access -> the ref line replaced (mode kept, one backup), deploy, deploy, health, RESULT: OK; a second run -> no new key,
+no second backup, RESULT: OK; an atp.sh without sha support -> STOP after the first deploy, exit 3; a .env without the
+line -> the line appended.
+
 Proposed order now: W0 (after 3b) -> W1 -> W2 -> W3 T1 -> W5 port-map re-point -> W3 T2..T6 -> W4 -> W6 .. W10.
+
+Status (1 Nov): W1 merged (#3). W2 host command tested (above). W3 T1-T6 merged (#4): layers 1-6, 48 / 48 cases
+byte-equal; golden / answer_key_v4 / trigger_5m / real_days comparisons are next. W5: Analyze-a-chart shim merged (#5,
+main ec152c9); ATP PR #857 (ATP_PRIVATE_REF may be a commit sha) is a draft, it must merge before the install block.
+The signal-engine shim (EN-1, `trade_engine.get_provider`) is not built; its flag stays OFF.
