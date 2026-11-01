@@ -2,7 +2,7 @@
 
 The build and the layer outputs are copied as is from Trade `scripts/reader_parity_export.py` at the snapshot commit
 (engine-snapshot-v2, 813358bc1064645fcf2ca005959d9658804633e3): `_jsonable`, `build`, `out_layer<N>`, `_bars`, `_at`,
-`EngineError` and the JSON-lines line format of `write_jsonl`. Only the import paths differ (`atp_private.trade_engine.`).
+`EngineError`, the layer outputs ported so far and the JSON-lines line format of `write_jsonl`. Only the import paths differ (`atp_private.trade_engine.`).
 The one part that is new here is reading a case's inputs back from the fixture CSV files (`load_case`).
 
     python -m atp_private.parity.runner --store "$ATP_PRIVATE_FIXTURES" --layer 1 [--case NIFTY_real ...]
@@ -114,8 +114,17 @@ def jsonl_line(r):
     return json.dumps(_jsonable(r), ensure_ascii=False, sort_keys=True) + "\n"
 
 
+def out_layer2(V):
+    """Every 15M bar's alive areas (levels.snapshot: band, tf, role, BREAK-2 state, far swing, Z facts, confluence), then every area
+    object built in the window with its whole lifecycle (births, bands, events, flip facts, dead bar, Z, uid)."""
+    for t in _bars(V):
+        yield {"bar": t, "ts": str(V.m15["timestamp"].iloc[t]), "levels": V.levels.snapshot(t)}
+    for L in V.levels.L:
+        yield {"object": L}
+
+
 # ------------------------------------------------------------------------------- ATP side
-OUTPUTS = {1: out_layer1}
+OUTPUTS = {1: out_layer1, 2: out_layer2}
 
 
 def snapshot_root(store):
