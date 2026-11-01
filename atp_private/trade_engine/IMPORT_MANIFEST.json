@@ -1,7 +1,7 @@
 {
  "source_repo": "abhishekwasu-hue/Trade",
- "tag": "engine-snapshot-v1",
- "commit": "79feb62d989383cefd14fe7d9c92fd10e9362ce5",
+ "tag": "engine-snapshot-v2",
+ "commit": "813358bc1064645fcf2ca005959d9658804633e3",
  "prefix": "atp_private.trade_engine",
  "modules": [
   "backtest_review/__init__.py",

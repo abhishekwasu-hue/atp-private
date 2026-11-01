@@ -76,9 +76,11 @@ def test_answer_key_v4_item_reads_the_same(data, it):
         assert len({Lv.uid for Lv in cands}) == 1                         # ONE object (one id)
     for Lv in cands:
         ev = [(ts.iloc[b], k) for b, k, _ in Lv.events if k in ("broken", "flip", "dead") and ts.iloc[b] >= w0 - pd.Timedelta(days=3)]
-        if it["id"] == "L03":                                              # BROKEN only on 28 Sep 09:15 (24–27 Sep beyond, not broken)
+        if it["id"] == "L03":                                              # BROKEN only on 29 Sep 09:15 (24–28 Sep beyond, not broken):
+            # owner ✅ DECISIONS 151 (M69): the follow-through target is the MOST RECENT external 1H low below the band (53,949.90,
+            # 8 Jun); 28 Sep 09:15 came only from the old tie that took the oldest pre-window low (55,263.75, 28 Apr)
             br = [x for x, k in ev if k == "broken"]
-            assert br and br[0] == pd.Timestamp("2026-09-28 09:15"), ev
+            assert br and br[0] == pd.Timestamp("2026-09-29 09:15"), ev
             assert Lv.state_at(t) == FL.FLIPPED and Lv.role_at(t) != Lv.role0
         elif it["id"] == "L04":                                            # the flip still alive (not dead)
             assert Lv.dead_bar is None and Lv.state_at(t) in (FL.FLIPPED, FL.BEYOND), (Lv.state_at(t), ev)

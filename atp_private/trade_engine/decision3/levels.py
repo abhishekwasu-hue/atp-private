@@ -155,6 +155,11 @@ class Level:
         return self.born_bar <= t and (self.dead_bar is None or self.dead_bar > t)
 
 
+def _ns(ts):
+    """M69: a candle timestamp as a sortable int (ns) — the own-TF swing's true date order (`ots`)."""
+    return int(pd.Timestamp(ts).value)
+
+
 def place_uid(tf, kind, base_ts):
     """Abhi A5 / DECISIONS 62 (one place = one id for its life): the place's identity from what built it — the band's own timeframe
     (1H / D / W), the side of its base (H = a swing high / supply base, L = a swing low / demand base) and the start of the base candle
@@ -936,7 +941,8 @@ class Levels:
         """SW2 (DECISIONS 92 / 109): the object's own-TF swings = the FINAL SW EXTERNAL swings of that TF (D / W: from the full Daily /
         Weekly history; 1H: from the 1H candles of the stored history before the window + the window's own). Each in the shape of
         `_own_swings_pivots`: bar = the 15M bar of its candle (−1 = before the window), xbar = the 15M bar of its extreme, confirm_bar =
-        the 15M bar whose close makes it FINAL (−1 = before the window). Built once."""
+        the 15M bar whose close makes it FINAL (−1 = before the window), ots = its own-TF candle's timestamp (ns; M69: the true order of
+        swings before the window, where bar ties at −1). Built once."""
         memo = self.__dict__.setdefault("_own_memo", {})
         if tf in memo:
             return memo[tf]
@@ -976,7 +982,8 @@ class Levels:
                             seg = self.A["high"][b15:e15] if x.kind == "H" else -self.A["low"][b15:e15]
                             xb = b15 + int(np.argmax(seg))
                     out.append(NS(kind=x.kind, price=float(x.price), bar=b15, confirm_bar=cb, close=float(dd["close"].iloc[x.bar]),
-                                  clo=float(dd["low"].iloc[x.bar]), chi=float(dd["high"].iloc[x.bar]), h1=None, xbar=xb))
+                                  clo=float(dd["low"].iloc[x.bar]), chi=float(dd["high"].iloc[x.bar]), h1=None, xbar=xb,
+                                  ots=_ns(dd["timestamp"].iloc[x.bar])))
         else:
             hist = self.h1_history
             h1 = self.h1
@@ -993,13 +1000,14 @@ class Levels:
                 j = x.bar - nh
                 if j < 0:
                     out.append(NS(kind=x.kind, price=float(x.price), bar=-1, confirm_bar=cb, close=float(allh["close"].iloc[x.bar]),
-                                  clo=float(allh["low"].iloc[x.bar]), chi=float(allh["high"].iloc[x.bar]), h1=None, xbar=-1))
+                                  clo=float(allh["low"].iloc[x.bar]), chi=float(allh["high"].iloc[x.bar]), h1=None, xbar=-1,
+                                  ots=_ns(allh["timestamp"].iloc[x.bar])))
                     continue
                 ix = np.flatnonzero(self.h1_of == j)
                 seg = self.A["high"][ix] if x.kind == "H" else -self.A["low"][ix]
                 xb = int(ix[int(np.argmax(seg))])
                 out.append(NS(kind=x.kind, price=float(x.price), bar=xb, confirm_bar=cb, close=float(self.A["close"][ix[-1]]),
-                              clo=None, chi=None, h1=j, xbar=xb))
+                              clo=None, chi=None, h1=j, xbar=xb, ots=_ns(allh["timestamp"].iloc[x.bar])))
         memo[tf] = out = sorted(out, key=lambda p: (p.confirm_bar, p.bar))
         return out
 
@@ -1007,8 +1015,8 @@ class Levels:
         """The object's OWN-timeframe swings (DECISIONS 76 / 82): 1H ⇒ the ordinary 1H swing = the structure's finest degree (D1, the
         approved structure degree — not the zone degree D2, which can leave an object "unbroken" while price runs far beyond); D ⇒ the
         Daily fold's swings; W ⇒ the Weekly fold's swings (detection unchanged). Each: kind, price, bar (the 15M bar of its candle; −1 =
-        before the 15M window), confirm_bar (the 15M bar it is KNOWN at; −1 = known before the window), close (its own candle's close).
-        Built once."""
+        before the 15M window), confirm_bar (the 15M bar it is KNOWN at; −1 = known before the window), close (its own candle's close),
+        ots (its own-TF candle's timestamp, ns — M69: the true order before the window). Built once."""
         memo = self.__dict__.setdefault("_own_memo", {})
         if tf in memo:
             return memo[tf]
@@ -1044,12 +1052,13 @@ class Levels:
                             seg = self.A["high"][b15:e15] if p.kind == "H" else -self.A["low"][b15:e15]
                             xb = b15 + int(np.argmax(seg))
                     out.append(NS(kind=p.kind, price=float(p.price), bar=b15, confirm_bar=cb, close=float(dd["close"].iloc[int(p.bar)]),
-                                  clo=float(dd["low"].iloc[int(p.bar)]), chi=float(dd["high"].iloc[int(p.bar)]), h1=None, xbar=xb))
+                                  clo=float(dd["low"].iloc[int(p.bar)]), chi=float(dd["high"].iloc[int(p.bar)]), h1=None, xbar=xb,
+                                  ots=_ns(dd["timestamp"].iloc[int(p.bar)])))
         else:
             deg = getattr(self, "_fin_deg", None)
             src = self.res["pivots"].get(deg) if deg is not None else None
             out = [NS(kind=p.kind, price=float(p.price), bar=int(p.bar), confirm_bar=int(p.confirm_bar), close=float(C[int(p.bar)]),
-                      clo=None, chi=None, h1=int(self.h1_of[int(p.bar)]), xbar=int(p.bar))
+                      clo=None, chi=None, h1=int(self.h1_of[int(p.bar)]), xbar=int(p.bar), ots=_ns(self.ts.iloc[int(p.bar)]))
                    for p in (src if src else self._pv_sorted)]
         memo[tf] = out = sorted(out, key=lambda p: (p.confirm_bar, p.bar))
         return out
@@ -1064,8 +1073,8 @@ class Levels:
         bey = [p for p in self._own_swings(L.tf) if p.confirm_bar <= t and p.kind == kind and ((p.price > hi) if up else (p.price < lo))
                and not self._internal(p, L, lo, hi, t)]
 
-        def pick(xs):                                                      # the most recent (its bar; ties: the later known)
-            return max(xs, key=lambda p: (p.bar, p.confirm_bar))
+        def pick(xs):                                                      # the most recent by its own-TF candle (M69: before the window every
+            return max(xs, key=lambda p: (p.ots, p.confirm_bar))           # bar is −1 — `max` on bar would return the OLDEST); ties: the later known
         pre = [p for p in bey if p.bar < start]
         if pre:
             return pick(pre), "before_break"
