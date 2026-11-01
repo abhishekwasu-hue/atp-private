@@ -178,8 +178,28 @@ def out_layer5(V):
         yield rec
 
 
+VERDICT = ("decision", "mark", "conviction", "why", "missing", "evidence_list", "confirming", "context_notes", "verdict_rule",
+           "entry_gate", "entries", "armed", "watch_alerts", "entry_models_on", "checklist", "trend_used", "trade_side")
+
+
+def out_layer6(V):
+    """The reader's output: the 15M verdict on every 15M bar (decide: decision, label, evidence list, entries / armed / WATCH, checklist),
+    then — the live path (trigger_tf = 5M, DECISIONS 37) — the whole decision row at every closed 5M candle (decide5: entry models
+    E1–E4 read on 5M, EN1 required set, EN2 invalidation, EN3 one entry per place, D+E trigger rules)."""
+    for t in _bars(V):
+        r = row15(V, t, 6)
+        yield {"tf": "15M", "bar": t, "ts": str(V.m15["timestamp"].iloc[t]), **{k: r.get(k) for k in VERDICT if k in r}}
+    F = V.trigger_frame()
+    for j in range(F.n):
+        try:
+            r = V.decide5(j)
+        except Exception as exc:                                            # noqa: BLE001 — re-raised with the 5M candle named
+            raise EngineError(f"layer 6: the engine raised on 5M candle {j} ({F.T(j)}): {type(exc).__name__}: {exc}") from exc
+        yield {"tf": "5M", "bar5": j, "decide5": r}
+
+
 # ------------------------------------------------------------------------------- ATP side
-OUTPUTS = {1: out_layer1, 2: out_layer2, 3: out_layer3, 4: out_layer4, 5: out_layer5}
+OUTPUTS = {1: out_layer1, 2: out_layer2, 3: out_layer3, 4: out_layer4, 5: out_layer5, 6: out_layer6}
 
 
 def snapshot_root(store):
