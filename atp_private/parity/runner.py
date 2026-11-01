@@ -137,8 +137,23 @@ def out_layer3(V):
         yield {"bar": t, "ts": str(V.m15["timestamp"].iloc[t]), "decide": row15(V, t)}
 
 
+def out_layer4(V):
+    from atp_private.trade_engine.decision3 import trendline as TL
+    for t in _bars(V):
+        rec = {"bar": t, "ts": str(V.m15["timestamp"].iloc[t])}
+        for name, d in (("down", TL.DOWN), ("up", TL.UP)):
+            ln = _at(4, V, t, TL.swing_line, V, t, d)
+            rt = _at(4, V, t, TL.reaction_touch, V, t, d, ln) if ln is not None else None
+            trend = "DOWN" if d == TL.DOWN else "UP"
+            _, _, act = _at(4, V, t, V.step2, t, trend)
+            lab = [{"id": x["id"], "lo": x["lo"], "hi": x["hi"], "confluence_label": x.get("confluence_label"),
+                    "line_touch": x.get("line_touch")} for x in act if x.get("confluence_line")]
+            rec[name] = {"line": ln, "reaction_touch": rt, "confluence": lab}
+        yield rec
+
+
 # ------------------------------------------------------------------------------- ATP side
-OUTPUTS = {1: out_layer1, 2: out_layer2, 3: out_layer3}
+OUTPUTS = {1: out_layer1, 2: out_layer2, 3: out_layer3, 4: out_layer4}
 
 
 def snapshot_root(store):
