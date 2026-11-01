@@ -1,0 +1,81 @@
+# M79 work list - engine takeover on engine-snapshot-v2 (T1-T14, corrections C1-C6 applied)
+
+Source: owner order M79 (ATP `docs/owner-orders/ATP_ORDER_M79.md`) and the Trade-side handover in trade-data, branch
+`claude/fix-proof-gallery`: `handover/2026-10-31_ATP_takeover/ATP_SESSION_PROMPT.md`, `PLAN.md`, `M65_REPORT.md`.
+The handover prompt was written for v1; every v1 reference below is replaced per C1-C6. Everything else in it stands.
+
+## Corrections applied everywhere
+- **C1** Snapshot = `engine-snapshot-v2` = Trade commit `813358bc1064645fcf2ca005959d9658804633e3` (Trade main). v1
+  (`79feb62`) is superseded: branch `import/engine-snapshot-v1` is never merged.
+- **C2** Verify by commit, not by tag: `atp_private/trade_engine/IMPORT_MANIFEST.json` commit = 813358b..., trade-data
+  `parity/engine-snapshot-v2/MANIFEST.json` commit = 813358b... (its `source_commit` 8e2b079 has the identical tree).
+  If the tag appears on Trade later, record it in the port map; nothing else changes.
+- **C3** Fixtures = trade-data `parity/engine-snapshot-v2/` (188 files + MANIFEST.json), on trade-data branch
+  `claude/fix-proof-gallery` (or `main` once merged). `parity/engine-snapshot-v1/` and `parity/layer1..4/` are superseded.
+- **C4** ATP work already built against v1 (M66 EN-4 parity CI text, `chart_analyze` provider, `docs/TRADE_PORT_MAP.md`
+  3a "Stable tag") is re-pointed to v2 in the same PRs; never two snapshots in one layer.
+- **C5** atp-private PR #1 (`claude/overseer-method-kit`, docs only) is reviewed and merged first.
+- **C6** The known failures of the copied tests (515 pass / 10 fail / 17 errors in Trade's run) are left-out ATP-GENERIC
+  dependencies; each becomes an ATP adapter or a visible skip with a reason, never a logic change.
+
+## What the owner has done / must do first (checked 1 Nov from this session)
+| # | Prerequisite | State | Evidence |
+|---|---|---|---|
+| 1 | `atp-private` exists, Private | present | GitHub API: `visibility = private` |
+| 2 | Claude GitHub app access to `atp-private` (push) | present | API permissions `push = true`; this branch was pushed and its draft PR opened |
+| 3a | Branch protection on `main` (PRs only, private CI required, no force push) | **missing** | API: branch `main` `protected = false`; rulesets API: "Upgrade to GitHub Pro or make this repository public"; protection on a private repo needs a paid plan |
+| 3b | Actions spending limit for private minutes | **missing / blocked** | Both CI runs (main push, PR #1) "not started because recent account payments have failed or your spending limit needs to be increased" |
+| 4 | Host READ-ONLY deploy key on `atp-private` | not verifiable here | the deploy-keys API path is refused by the session proxy; owner to confirm on the Deploy keys page |
+| 5 | Trade repo Private + tokens rotated (Upstox / Telegram / Stoxkart) | Private: present; rotation: not verifiable | API: Trade `visibility = private`; token rotation is outside any repo |
+
+Click paths (PRIVATE_PACKAGE section 6):
+- 3a: atp-private -> Settings -> Branches -> Add branch protection rule `main`: require a pull request, require the
+  status check `test` (ci), block force pushes. (Needs GitHub Pro on a private repo.)
+- 3b: GitHub (account) -> Settings -> Billing and plans -> Payment information / Spending limits -> Actions: fix the
+  payment method or set a limit; 0 still blocks private runs once the free minutes are used.
+- 4: atp-private -> Settings -> Deploy keys -> Add deploy key (host `.pub` only, "Allow write access" unticked).
+- 5: rotate in each broker / Telegram console; nothing to do in GitHub.
+
+## Facts checked for the import (1 Nov)
+- Trade: 813358b is Trade `main` HEAD; 813358b and 8e2b079 have the same tree; no `engine-snapshot-*` tag on Trade yet.
+- `import/engine-snapshot-v2` (4315308): IMPORT_MANIFEST commit = 813358b; 190 listed files all present; against Trade
+  at 813358b: 97 byte-equal, 93 differ only in import lines (the 93 the manifest lists as rewritten); 0 other diffs.
+- No `.env`, key, database or market-data file; no server address. Committed by mistake: `atp_private/__pycache__/*.pyc`.
+- The branch has **no common history with `main`** (its root is the v1 import commit, itself a root commit), so GitHub
+  cannot open a PR from it. Merging locally with `--allow-unrelated-histories` is conflict-free and keeps main's
+  `atp_private/__init__.py` and `atp_private/trade_engine/__init__.py` (the v2 copies are empty).
+- Copied tests on main + v2 (Python 3.13, Trade's matplotlib / plotly installed): 501 passed, 14 skipped (private
+  trade-data not present, visible reason), 10 failed, 17 errors, 1 xfailed. 501 + 14 = Trade's 515.
+  - 10 failed: config (3: claim / mark_seen path), cloud_db (3), scripts or files read by path (4).
+  - 17 errors: repo parquet (13), cloud_db at module level (1), research module / file read by path (2), a Trade
+    script module not copied (1).
+- Fixtures: MANIFEST commit = 813358b; 188 / 188 files match their sha256; no unlisted file.
+
+## The work (one draft PR per step, self-reviewed, merge on green CI, PAPER only, flags OFF)
+- **W0 (C5)** Merge PR #1 overseer kit once CI can run (blocked by 3b).
+- **W1 Import (T1-T6 base)**: a new branch from `main` that carries the v2 tree as one commit on top of `main` (no
+  force push, no history rewrite; v1 never merged), without the committed `__pycache__`, keeping main's two
+  `__init__.py` files; then PR -> main. In the same PR: the private CI job (PRIVATE_PACKAGE sections 5, 13) running the
+  copied tests, the stale-pack test and `tests/test_reader_no_numbers.py`; every C6 failure turned into a visible skip
+  with a reason (`ATP adapter not ported yet: config | cloud_db`, `repo data file not in the package`, `Trade script
+  read by path, not ported`) or an adapter; the 14 data tests skip visibly when the store is not mounted.
+- **W2 Fixtures store (T13)**: a dry-run-first host command copying trade-data `parity/engine-snapshot-v2/` from branch
+  `claude/fix-proof-gallery` (or `main` once merged) into `<ATP_PRIVATE_FIXTURES>/parity/engine-snapshot-v2/`, checking
+  all 188 files against MANIFEST.json and stopping on the first mismatch; commit only paths + sha256. Owner runs ONE block.
+- **W3 Parity per layer (T1-T6)**: one PR per layer, reading the store (skip visibly if not mounted, error if set but
+  empty); build exactly as Trade's `scripts/reader_parity_export.build`; byte-equal after `_jsonable`; layer 1 swings +
+  SW + step 1; 2 areas, BREAK-2 lifecycle, Z; 3 the 15M decision row; 4 lines + confluence; 5 RSI (C); 6 verdicts + every
+  5M `decide5` row (EN1-EN3, D+E, E1-E4); plus golden, answer_key_v4, trigger5m, days. A difference = port bug.
+- **W4 English owner modules (T1-T6)**: per the port map targets; logic copied as is, module headers name
+  `engine-snapshot-v2` + 813358b; parity of W3 stays green; `atp_private/trade_engine/` is kept.
+- **W5 Public boundary (ATP repo, C4)**: provider / loader / adapter per PRIVATE_PACKAGE sections 9-10 on the existing
+  `backend/app/engine_provider/`; flags OFF; port map 3a "Stable tag" = `engine-snapshot-v2` (commit 813358b) with the
+  re-port note; M66 EN-4 and `chart_analyze` provider re-pointed to v2. No method text, fixture or Trade logic public.
+- **W6 T7** KB / Method Pack from `atp_private/trade_engine/docs/knowledge/` (pack hash = STABLE row) + stale-pack test.
+- **W7 T8** Vision method checklist from the Method Pack, audit only (ADR-0006), human_confirm.
+- **W8 T9 / T10 / T11** design notes first, then ATP-GENERIC adapters only; SL / target / lots / exits / approval
+  window from the user's dashboard settings; exits never blocked (ADR-0004); T11 only after T6.
+- **W9 T12 / T14** `atp.sh import-trade` driven by EXPORT_MANIFEST.json (sha256, dry run, idempotent). Owner runs it.
+- **W10 Shadow run** ATP PAPER beside Trade PAPER; switch-over and SUNSET only on the owner's own words.
+
+Proposed order now: W0 (after 3b) -> W1 -> W2 -> W3 T1 -> W5 port-map re-point -> W3 T2..T6 -> W4 -> W6 .. W10.
