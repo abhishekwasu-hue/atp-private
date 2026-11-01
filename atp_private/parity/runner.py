@@ -123,8 +123,22 @@ def out_layer2(V):
         yield {"object": L}
 
 
+def row15(V, t, layer=3):
+    """V.decide(t), read once per bar and shared by layers 3, 5, 6 and the golden file (the engine is deterministic: a second read of
+    the same bar is the same row)."""
+    memo = V.__dict__.setdefault("_parity_rows15", {})
+    if t not in memo:
+        memo[t] = _at(layer, V, t, V.decide, t)
+    return memo[t]
+
+
+def out_layer3(V):
+    for t in _bars(V):
+        yield {"bar": t, "ts": str(V.m15["timestamp"].iloc[t]), "decide": row15(V, t)}
+
+
 # ------------------------------------------------------------------------------- ATP side
-OUTPUTS = {1: out_layer1, 2: out_layer2}
+OUTPUTS = {1: out_layer1, 2: out_layer2, 3: out_layer3}
 
 
 def snapshot_root(store):
