@@ -260,6 +260,8 @@ line -> the line appended.
 Proposed order now: W0 (after 3b) -> W1 -> W2 -> W3 T1 -> W5 port-map re-point -> W3 T2..T6 -> W4 -> W6 .. W10.
 
 Status (1 Nov): W1 merged (#3). W2 host command tested (above). W3 T1-T6 merged (#4): layers 1-6, 48 / 48 cases
-byte-equal; golden / answer_key_v4 / trigger_5m / real_days comparisons are next. W5: Analyze-a-chart shim merged (#5,
+byte-equal. W3 comparisons (`atp_private/parity/extras.py`, local run on the v2 store, 1 Nov): golden 3 / 3
+(golden.json + 2 chart cases), answer_key_v4 8 / 8, trigger_5m 20 / 20, real_days 20 / 20 day files (+ the chosen days
+equal the MANIFEST for both indices). W5: Analyze-a-chart shim merged (#5,
 main ec152c9); ATP PR #857 (ATP_PRIVATE_REF may be a commit sha) is a draft, it must merge before the install block.
 The signal-engine shim (EN-1, `trade_engine.get_provider`) is not built; its flag stays OFF.
