@@ -78,4 +78,110 @@ Click paths (PRIVATE_PACKAGE section 6):
 - **W9 T12 / T14** `atp.sh import-trade` driven by EXPORT_MANIFEST.json (sha256, dry run, idempotent). Owner runs it.
 - **W10 Shadow run** ATP PAPER beside Trade PAPER; switch-over and SUNSET only on the owner's own words.
 
+## W2 host command (T13) - the owner runs this ONE block on the ATP host, as root
+
+Before it, once: as the `atp` user, `ssh-keygen -t ed25519 -f ~/.ssh/trade_data_ro -N "" -C "atp host trade-data read-only"`,
+then trade-data -> Settings -> Deploy keys -> Add deploy key: paste `~/.ssh/trade_data_ro.pub`, "Allow write access"
+unticked. (GitHub allows a key on one repository only, so this is a second key beside `atp_private_ro`.)
+
+What it does: a sparse, depth-1 fetch of trade-data branch `claude/fix-proof-gallery`, only `parity/engine-snapshot-v2/`.
+It checks the MANIFEST commit (813358b), all 188 sha256 and that there is no unlisted file. Then it renames the folder
+into `/opt/atp/private_fixtures/parity/engine-snapshot-v2/` (read-only) and checks it again.
+- Idempotent: if the folder is already there and verifies, it does nothing.
+- Fail-safe: if the folder is there and does not verify, it stops and leaves it untouched. On any mismatch, missing or
+  unlisted file it stops with exit 1 and writes nothing to the store.
+- It runs in the background as `atp`. The last line of the log is `RESULT: OK` or `RESULT: FAILED (exit N)`.
+
+```bash
+cat > /tmp/atp-m79-fixtures.sh <<'ATPEOF'
+#!/usr/bin/env bash
+# M79 W2 / T13: copy trade-data parity/engine-snapshot-v2 into the private fixtures store, every file checked.
+set -euo pipefail
+SNAP=engine-snapshot-v2
+COMMIT=813358bc1064645fcf2ca005959d9658804633e3
+BRANCH="${BRANCH:-claude/fix-proof-gallery}"
+REPO="${REPO:-git@github.com:abhishekwasu-hue/trade-data.git}"
+KEY="${KEY:-$HOME/.ssh/trade_data_ro}"
+STORE="${STORE:-/opt/atp/private_fixtures}"
+DEST="$STORE/parity/$SNAP"
+WORK="$STORE/.incoming-$SNAP"
+say() { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+fail() { say "STOP: $*"; exit 1; }
+trap 'rc=$?; rm -rf "$WORK"; [ $rc -eq 0 ] || say "RESULT: FAILED (exit $rc)"' EXIT
+[ "$(id -un)" = atp ] || [ -n "${ALLOW_ANY_USER:-}" ] || fail "run as the atp user"
+command -v git >/dev/null && command -v python3 >/dev/null || fail "git and python3 are needed"
+case "$REPO" in git@*) [ -r "$KEY" ] || fail "read-only deploy key $KEY not found"
+  export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" ;; esac
+
+# verify DIR: MANIFEST commit, every listed file's sha256, no unlisted file. Prints one line; non-zero on any problem.
+verify() {
+  python3 - "$1" "$COMMIT" 2>&1 <<'PY'
+import hashlib, json, os, sys
+root, commit = sys.argv[1], sys.argv[2]
+m = json.load(open(os.path.join(root, "MANIFEST.json")))
+if m.get("commit") != commit:
+    sys.exit(f"MANIFEST commit {m.get('commit')} is not {commit}")
+files = m["files"]
+have = set()
+for d, _, fs in os.walk(root):
+    for f in fs:
+        have.add(os.path.relpath(os.path.join(d, f), root))
+have.discard("MANIFEST.json")
+unlisted = sorted(have - set(files))
+if unlisted:
+    sys.exit(f"unlisted file(s): {unlisted[:5]} ({len(unlisted)})")
+for rel, want in sorted(files.items()):
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p):
+        sys.exit(f"missing: {rel}")
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != want:
+        sys.exit(f"sha256 mismatch: {rel}")
+print(f"verified {len(files)} / {len(files)} files, commit {commit[:7]}, no unlisted file")
+PY
+}
+
+say "M79 W2: $SNAP -> $DEST"
+if [ -e "$DEST" ]; then
+  say "already present: checking it"
+  out="$(verify "$DEST")" || fail "the installed copy does not verify (left untouched): $out"
+  say "$out"; say "nothing to do"; say "RESULT: OK"; exit 0
+fi
+mkdir -p "$STORE/parity"
+avail=$(df -Pk "$STORE" | awk 'NR==2{print $4}')
+[ "$avail" -gt 1500000 ] || fail "less than 1.5 GB free under $STORE"
+rm -rf "$WORK"
+say "fetching branch $BRANCH (sparse, depth 1)"
+git clone -q --depth 1 --filter=blob:none --sparse --no-tags --branch "$BRANCH" "$REPO" "$WORK/repo"
+git -C "$WORK/repo" sparse-checkout set --no-cone "/parity/$SNAP/"
+say "trade-data commit $(git -C "$WORK/repo" rev-parse --short HEAD)"
+SRC="$WORK/repo/parity/$SNAP"
+[ -f "$SRC/MANIFEST.json" ] || fail "no parity/$SNAP/MANIFEST.json on $BRANCH"
+out="$(verify "$SRC")" || fail "$out"
+say "$out"
+mv "$SRC" "$WORK/$SNAP"
+mv "$WORK/$SNAP" "$DEST"
+chmod -R a-w "$DEST"
+out="$(verify "$DEST")" || fail "after the move: $out"
+say "$out"
+say "installed: $DEST ($(du -sh "$DEST" | cut -f1))"
+say "RESULT: OK"
+ATPEOF
+chown atp /tmp/atp-m79-fixtures.sh && su - atp -c "nohup bash /tmp/atp-m79-fixtures.sh > /tmp/atp-m79-fixtures.log 2>&1 &"
+```
+After a minute: `tail -n 8 /tmp/atp-m79-fixtures.log`.
+
+Tested in the session (1 Nov) against trade-data with a temporary store (`STORE=`, `REPO=` overrides):
+- First run: 188 / 188 verified, installed (424 MB), `RESULT: OK`.
+- Second run: "nothing to do", `RESULT: OK`.
+- One byte flipped in an installed file: "sha256 mismatch", exit 1, left untouched.
+- An extra file: "unlisted file(s)", exit 1.
+- A source branch with one corrupted byte: "sha256 mismatch", exit 1, the store stays empty.
+
+Open point (default used): the store path is `/opt/atp/private_fixtures` until the owner names another one.
+`ATP_PRIVATE_FIXTURES` and `BACKUP_EXTRA_DIRS` in `/opt/atp/.env` are set later by an `atp.sh` PR (W9), not here.
+
 Proposed order now: W0 (after 3b) -> W1 -> W2 -> W3 T1 -> W5 port-map re-point -> W3 T2..T6 -> W4 -> W6 .. W10.
