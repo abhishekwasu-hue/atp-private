@@ -1,21 +1,22 @@
 """atp_private: ATP's private package (method / engine code lives only here, never in the public ATP repository).
 
-SKELETON. No engine has been imported yet: the Trade engine snapshot goes in under `atp_private/trade_engine/` (Trade
-order M65), and the shim that adapts it to ATP's provider interface lands after that (ATP order M66, EN-1/EN-4).
-Until then every engine entry point fails closed with `EngineNotImported`, so ATP's loaders report the engine as
-unavailable instead of pretending to work.
+The Trade engine snapshot engine-snapshot-v2 (Trade commit 813358b) is imported under `atp_private/trade_engine/`
+(owner order M79, W1). Entry points for ATP's loaders:
+- `atp_private.chart_analyze.get_provider()`: the Analyze-a-chart provider (M79 W5), built on the snapshot's Method Pack.
+- `atp_private.trade_engine.get_provider()`: the signal-engine provider; its shim (EN-1) is not built yet, so it still
+  fails closed with `EngineNotImported` and ATP's signal engine stays off.
 """
 from typing import Dict
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
-#: False until the Trade engine snapshot (M65) and its shim are imported. Flip only in the PR that imports them.
-ENGINE_IMPORTED = False
+#: True: the Trade engine snapshot (engine-snapshot-v2) is imported and the Analyze-a-chart shim is in place (M79 W5).
+ENGINE_IMPORTED = True
 STATUS_NOT_IMPORTED = "engine package present, engine not yet imported"
 
 
 class EngineNotImported(RuntimeError):
-    """Raised by every `get_provider()` while the package is a skeleton (no engine code imported yet)."""
+    """Raised by an entry point whose shim is not built yet (today: `atp_private.trade_engine.get_provider()`)."""
 
     def __init__(self, module: str) -> None:
         super().__init__(f"{module}: {STATUS_NOT_IMPORTED}")
