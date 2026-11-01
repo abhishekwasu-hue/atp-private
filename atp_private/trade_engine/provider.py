@@ -191,7 +191,9 @@ class Provider:
         if symbol is None:
             return self._problem(UNKNOWN_INSTRUMENT)
         s = dict(request.settings or {})
-        with _LOCK, warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+        from atp_private.adapters import trade_config
+        with _LOCK, trade_config.use_calendar(request.calendar), warnings.catch_warnings(), \
+                contextlib.redirect_stdout(io.StringIO()):
             warnings.simplefilter("ignore")
             try:
                 s3 = L.v22_settings(s)
