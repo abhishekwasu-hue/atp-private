@@ -12,7 +12,10 @@ requires-python = ">=3.13"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=8"]
+# The copied Trade tests also need these (Trade's pins). They are NOT in ATP's backend image today, so they are test-only
+# here; whether the image gets them is decided with the provider port (M79 W5). The rest comes from ATP's
+# backend/requirements.txt at ATP_VERSION (the CI job installs it first).
+test = ["pytest>=8", "matplotlib~=3.11", "plotly~=7.0", "pyyaml~=6.0", "requests~=2.33"]
 
 [tool.setuptools.dynamic]
 version = { attr = "atp_private.__version__" }
@@ -21,4 +24,4 @@ version = { attr = "atp_private.__version__" }
 include = ["atp_private*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "atp_private/trade_engine/tests"]

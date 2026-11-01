@@ -12,17 +12,34 @@ permissions:
   contents: read
 
 jobs:
+  # The private CI job (PRIVATE_PACKAGE.md section 5): runs in this private repository, so its logs stay private.
+  # No key needed: it checks out this repository and the public ATP repository at the commit in ATP_VERSION.
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: ATP version
+        id: atp
+        run: echo "ref=$(tr -d '[:space:]' < ATP_VERSION)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: abhishekwasu-hue/AdvanceTradingPlatform
+          ref: ${{ steps.atp.outputs.ref }}
+          path: _atp
+          sparse-checkout: backend/requirements.txt
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"   # ATP's backend image (python:3.13-slim)
-      - name: Install the package
-        run: python -m pip install --upgrade pip && python -m pip install ".[test]"
+      - name: Install ATP backend requirements and the package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r _atp/backend/requirements.txt
+          python -m pip install -e ".[test]"
       - name: Package status
         run: python -c "import atp_private, json; print(json.dumps(atp_private.status()))"
-      - name: Tests
-        run: python -m pytest -q -rs
+      - name: Tests (package + copied Trade engine tests; C6 skips print their reason)
+        run: python -m pytest -q -rfEs -p no:cacheprovider
