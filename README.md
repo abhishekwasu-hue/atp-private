@@ -69,7 +69,7 @@ and check each against ATP's requirements (a missing one is an ATP PR, not an in
 In this repository's own GitHub Actions (private logs):
 
 - the snapshot's copied tests;
-- trade-data `parity/engine-snapshot-v1/` fixtures run through ATP's adapter and runner at `ATP_VERSION`; outputs
+- trade-data `parity/engine-snapshot-v2/` fixtures (M79 C4: v1 superseded) run through ATP's adapter and runner at `ATP_VERSION`; outputs
   (areas, states, swings, signals) must equal Trade's **byte for byte** - nothing is "close enough";
 - ATP's backend tests at `ATP_VERSION` with the package installed and `ATP_PRIVATE_FIXTURES=fixtures/`;
 - logs print case ids and field names only, never fixture content or method text.
