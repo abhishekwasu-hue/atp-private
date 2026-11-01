@@ -1,0 +1,10 @@
+MR={
+"L01":("SWEEP — area जिवंत (support)","11 Sep 10:15 ला कळलं","band खाली gap ने close झाला, पण खाली एकही pullback high (swing) तयार झाला नाही; थेट आत परत, दिवस 56,606 ला बंद. BREAK-1 (b) ⇒ sweep. Reader चा 11 Sep 10:15 चा E4(b) bear call नसायलाच हवा."),
+"L02":("SWEEP — area जिवंत (support)","16 Sep ~12:15 ला कळलं","15 Sep 14:00 → 16 Sep 10:00 band खाली अनेक closes आणि दोन lows, पण खाली टिकलेला pullback high नाही. खालचे दोन lows म्हणजे फक्त टोक, स्वीकार नाही ⇒ sweep."),
+"L03":("BROKEN (24 Sep) ⇒ resistance मध्ये FLIP","24 Sep 11:45 ला कळलं (15M swing high 55,670.8 confirm)","band खाली close + खाली swing high 55,671 तयार आणि price खालीच ⇒ broken. 11:45 पासून flipped resistance; 25 Sep चा खालून retest हा bear call ची जागा असू शकतो."),
+"L04":("SWEEP — flipped resistance अजून जिवंत (dead नाही)","19 Oct पर्यंत स्थिती तीच","15 Oct ला वर 4 closes, पण वर टिकलेला pullback low नाही, price आत परत. 'broken back' ला तोच (b) नियम ⇒ पूर्ण नाही ⇒ flip dead नाही."),
+"L05":("SWEEP — supply जिवंत","20 Jul 09:15 ला कळलं","17 Jul ला वर मजबूत close, पण वर टिकलेला pullback low नाही; दुसऱ्या दिवशी gap ने खाली. ⇒ sweep. Reader ने BROKEN म्हणून 20 Jul 14:15 ला E4(b) घेतला — label चूक."),
+"L06":("26 Aug BROKEN (support मध्ये flip) → 28 Aug DEAD","broken 26 Aug 10:45 ला; dead 28 Aug 11:15 ला","26 Aug gap candle वर close + वर swing low 57,824 ⇒ broken, flipped support. 27–28 Aug परत खाली close + खाली swing high 57,596 ⇒ broken back ⇒ DEAD (31 Aug चा spike त्याला जिवंत करत नाही). म्हणून E26 चा 26 Aug 09:15 bear call नसायलाच हवा."),
+"L07":("3 वेळा SWEEP — resistance जिवंत; एकच object (एक id)","24 Sep च्या gap down पर्यंत तीच स्थिती","21–23 Sep वर 17 closes, पण 56,570 वर एकदाही pullback low टिकला नाही. ⇒ sweep. एक band = एक id (288 / 289 एकच object)."),
+"L08":("28 Sep BROKEN ⇒ FLIP resistance; परत तुटला नाही (जिवंत)","broken 28 Sep 12:15 ला कळलं","खाली close + खाली swing high 54,661 ⇒ broken. October मध्ये price band मध्ये परत आलं पण 56,098.7 वर close नाही ⇒ flip जिवंत. टीप: 1,207 pt चा Weekly band एक जागा म्हणून खूप रुंद — हा वेगळा (area band) मुद्दा."),
+}
