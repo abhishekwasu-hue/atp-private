@@ -270,3 +270,9 @@ live path (engine3_live) on a feed served from ATP's request bars, mapped to ATP
 steps / setup / evidence tokens empty (needs a public phrase table); swings empty (no HH / HL labels in the engine);
 ATP runner windows default to 10 intraday / 400 daily days, Trade's live path reads 90 days 15M + up to 1825 days of
 15M history and 3650 Daily days - the runner settings decide what the engine gets.
+
+Status (1 Nov, W6-W10 session): W6 KB / Method Pack (`knowledge/`, `atp_private.method_pack`, pack 1674732c62ba =
+STABLE row) and W7 private side (Vision checklist + validator from the pack) built; W8 calendar adapter built (engine
+config from ATP's request calendar) with ATP PR #863 (runner windows per timeframe as settings: 15m 90 + history
+1825, Daily 400 + history 3650; calendar to the end of the next year); W9 design only (`docs/M79_W7_W10_DESIGN.md`,
+waits for the owner's O-2); W10 shadow diff built here + ATP PR #865 (day export). T9-T11 wait for the owner (O-1).
