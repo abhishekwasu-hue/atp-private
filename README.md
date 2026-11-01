@@ -11,8 +11,8 @@ No engine is imported yet. Every entry point fails closed:
 
 | Module | ATP loader | Today |
 |---|---|---|
-| `atp_private.chart_analyze` | `backend/app/chart_analyze/provider.py` (exists) | `get_provider()` raises `EngineNotImported` -> ATP reports the engine off ("the engine failed to start (EngineNotImported)"); health: `chart analysis engine: MISSING` |
-| `atp_private.trade_engine` | `backend/app/engine_provider/` (M66 EN-1, not built yet) | `get_provider()` raises `EngineNotImported` |
+| `atp_private.chart_analyze` | `backend/app/chart_analyze/provider.py` (exists) | the Analyze-a-chart provider on the snapshot's Method Pack (M79 W5) |
+| `atp_private.trade_engine` | `backend/app/engine_provider/` (M66 EN-1) | `get_provider()` = the signal-engine shim (`provider.py`, M79): the engine's live path behind ATP's interface 1; needs ATP's backend on the import path; ATP's `trade_engine` flag stays OFF |
 
 `atp_private.status()` -> `{"version": "0.0.1", "engine_imported": false, "status": "engine package present, engine not yet imported"}`.
 

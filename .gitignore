@@ -9,3 +9,5 @@ dist/
 *.pem
 id_*
 *_ro
+# the engine's own fold / history cache (engine3_live.cache_dir default), never committed
+atp_private/trade_engine/data/

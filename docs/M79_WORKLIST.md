@@ -264,4 +264,9 @@ byte-equal. W3 comparisons (`atp_private/parity/extras.py`, local run on the v2 
 (golden.json + 2 chart cases), answer_key_v4 8 / 8, trigger_5m 20 / 20, real_days 20 / 20 day files (+ the chosen days
 equal the MANIFEST for both indices). W5: Analyze-a-chart shim merged (#5,
 main ec152c9); ATP PR #857 (ATP_PRIVATE_REF may be a commit sha) is a draft, it must merge before the install block.
-The signal-engine shim (EN-1, `trade_engine.get_provider`) is not built; its flag stays OFF.
+The signal-engine shim (EN-1, `trade_engine.get_provider` -> `trade_engine/provider.py`) is built: the engine's own
+live path (engine3_live) on a feed served from ATP's request bars, mapped to ATP's interface 1; ATP's loader loads it
+(tested against ATP's real loader and contract). ATP's `trade_engine` flag stays OFF. Open (owner, defaults used): card
+steps / setup / evidence tokens empty (needs a public phrase table); swings empty (no HH / HL labels in the engine);
+ATP runner windows default to 10 intraday / 400 daily days, Trade's live path reads 90 days 15M + up to 1825 days of
+15M history and 3650 Daily days - the runner settings decide what the engine gets.

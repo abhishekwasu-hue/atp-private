@@ -1,7 +1,5 @@
-"""The package imports, reports its version and state; the signal-engine entry point still fails closed (EN-1 not built)."""
+"""The package imports and reports its version and state; the signal-engine entry point is the EN-1 shim."""
 import re
-
-import pytest
 
 import atp_private
 import atp_private.trade_engine as trade_engine
@@ -15,8 +13,8 @@ def test_version_and_imported_status():
     assert state["status"] == "engine imported"
 
 
-def test_signal_engine_entry_point_fails_closed_until_its_shim():
-    assert trade_engine.ENGINE_IMPORTED is False
+def test_signal_engine_entry_point_is_the_shim():
+    assert trade_engine.ENGINE_IMPORTED is True
     assert trade_engine.SNAPSHOT_TAG == "engine-snapshot-v2"
-    with pytest.raises(atp_private.EngineNotImported, match="not yet imported"):
-        trade_engine.get_provider()
+    assert trade_engine.TAG == "engine-snapshot-v2"
+    assert callable(trade_engine.get_provider)
