@@ -14,3 +14,8 @@ edit this folder by hand; a re-sync for a new tag replaces it as a whole.
 - ATP-GENERIC modules (Telegram, PAPER fills, exits, approvals, brokers, storage, config) are NOT copied: ATP has its own. A copied module
   that imports one of them at call time needs ATP's adapter when that path is ported (the list: Trade `docs/reader/EXPORT_MANIFEST.md`).
 - PAPER only; LIVE untouched; the method code never goes into ATP's public repository.
+
+## Version note
+This is **engine-snapshot-v2** (Trade main 813358b): it includes the M69 BREAK-2 fix (the follow-through target is the most recent
+own-TF external swing by its own date; Trade DECISIONS 151). **engine-snapshot-v1** (branch import/engine-snapshot-v1, Trade 79feb62)
+predates that fix and must not be ported. Parity fixtures for this version: trade-data `parity/engine-snapshot-v2/` (MANIFEST.json).
