@@ -152,8 +152,34 @@ def out_layer4(V):
         yield rec
 
 
+def _found(x, keys, path=""):
+    """Every value under one of `keys` anywhere inside x, with its path (the RSI facts the entry models attached to their reads)."""
+    if isinstance(x, dict):
+        for k, v in x.items():
+            p = f"{path}.{k}" if path else str(k)
+            if k in keys:
+                yield p, v
+            else:
+                yield from _found(v, keys, p)
+    elif isinstance(x, (list, tuple)):
+        for i, v in enumerate(x):
+            yield from _found(v, keys, f"{path}[{i}]")
+
+
+def out_layer5(V):
+    """C (RSI): rsi2's facts at every 15M bar (the RSI value, per degree and side the latest pair, divergence or the absence statement),
+    then every RSI read the decision row carries (zone read, entries, armed visits, WATCH) with its path in the row."""
+    V.rsi_divergence(0, -1, 0)                                              # builds the engine's own rsi2 reader (V._rsi), pure
+    rs = V._rsi
+    for t in _bars(V):
+        rec = {"bar": t, "ts": str(V.m15["timestamp"].iloc[t])}
+        rec["rsi2"] = rs if isinstance(rs, str) else _at(5, V, t, rs.read, t)
+        rec["reads"] = dict(_found(row15(V, t, 5), ("rsi", "rsi_divergence")))
+        yield rec
+
+
 # ------------------------------------------------------------------------------- ATP side
-OUTPUTS = {1: out_layer1, 2: out_layer2, 3: out_layer3, 4: out_layer4}
+OUTPUTS = {1: out_layer1, 2: out_layer2, 3: out_layer3, 4: out_layer4, 5: out_layer5}
 
 
 def snapshot_root(store):
