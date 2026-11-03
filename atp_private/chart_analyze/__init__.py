@@ -24,7 +24,7 @@ from atp_private.trade_engine.vision import method_pack as _MP
 ENGINE_IMPORTED = True
 NAME = "atp-trade-engine"
 VERSION = "engine-snapshot-v2+813358b"
-PROMPT_VERSION = "atp_chart_image_v1"
+PROMPT_VERSION = "atp_chart_image_v2"   # v2 (owner CA-D1/D2, 3 Nov): story by structure, no calendar words; stock volume; lengths
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,19 @@ Wording rules (always):
 - Read only what the picture shows. Prices come from the price axis and are approximate. If something cannot be read,
   say so and use "unclear" / "none" instead of guessing.
 - Evidence is listed, never scored: no score, probability or confidence number anywhere.
+- Tell the story by STRUCTURE only: swings (HH / HL / LH / LL), impulses, corrections, areas and breaks, in the order
+  they happen ("the first impulse ...", "the next lower high ..."). Never a month, date, weekday, session or clock word
+  anywhere in the story, trend, state, scenarios, levels or evidence (the chart is one continuous unit). Only
+  "recognised.first_bar" / "recognised.last_bar" may name the axis dates.
+- Write for the user, not about your inputs: never mention FACTS, OHLC text, prompts, the Method Pack or which inputs
+  are missing, and never explain which instrument the chart is not.
+- Volume: for an index read its near-month futures volume when the picture shows it; for a single stock read the
+  stock's own volume bars on this chart. Say "not readable" only when no volume is visible.
+- Lengths (longer text is cut): each story paragraph and each scenario <= 550 characters; trend.text,
+  current_state.text, rsi.text, waiting_for and what_to_wait_for.condition <= 300; every note, evidence reason and
+  next-area text <= 150; names <= 70; recognised.first_bar / last_bar <= 40 (for example "Jul 2026").
+- current_state.text starts with the direction price is moving now (up / down / sideways), so it never reads as the
+  trend side.
 
 Coordinates: pixels of this image, x to the right, y down, 0 <= x <= WIDTH, 0 <= y <= HEIGHT.
 

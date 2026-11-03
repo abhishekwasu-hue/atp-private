@@ -105,3 +105,15 @@ def test_a_reply_in_the_format_passes_atp_contract():
     raw = CA.get_provider().parse_image_only("```json\n" + json.dumps(SAMPLE) + "\n```", width=W, height=H)
     out = contract.validate(raw, mode="image_only", width=W, height=H)
     assert out["story"] and out["setup"]["side"] == "bear_call" and out["annotations"]["swings"]
+
+
+def test_format_text_owner_review_rules():
+    """Owner CA-D1 / CA-D2 (3 Nov GLENMARK review): story by structure, no calendar words; stock volume; no input
+    words; lengths the server keeps."""
+    import atp_private.chart_analyze as ca
+    t = ca.FORMAT_TEXT
+    assert ca.PROMPT_VERSION == "atp_chart_image_v2"
+    assert "Tell the story by STRUCTURE only" in t and "Never a month, date, weekday, session or clock word" in t
+    assert "never mention FACTS, OHLC text" in t
+    assert "for a single stock read the" in t and "stock's own volume bars" in t
+    assert "<= 550 characters" in t and "<= 300" in t and "<= 40" in t
