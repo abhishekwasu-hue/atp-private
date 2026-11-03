@@ -12,6 +12,7 @@ No engine is imported yet. Every entry point fails closed:
 | Module | ATP loader | Today |
 |---|---|---|
 | `atp_private.chart_analyze` | `backend/app/chart_analyze/provider.py` (exists) | the Analyze-a-chart provider on the snapshot's Method Pack (M79 W5) |
+| `atp_private.chart_reader` | ATP's AI chart reading service (M86) | `get_reader()`: the book-knowledge chart reader (Abhi's method or one of 17 independent book strategies), ported from trade-data `books/ai/chart_read.py` 6dd8bf4; the caller passes its anthropic client, model and effort (M86 W1) |
 | `atp_private.trade_engine` | `backend/app/engine_provider/` (M66 EN-1) | `get_provider()` = the signal-engine shim (`provider.py`, M79): the engine's live path behind ATP's interface 1; needs ATP's backend on the import path; ATP's `trade_engine` flag stays OFF |
 
 `atp_private.status()` -> `{"version": "0.0.1", "engine_imported": false, "status": "engine package present, engine not yet imported"}`.
@@ -27,6 +28,7 @@ atp_private/
   __init__.py          __version__, ENGINE_IMPORTED, status(), EngineNotImported
   trade_engine/        Trade engine snapshot (M65) + the shim get_provider() for ATP's provider interface (M66)
   chart_analyze/       Analyze-a-chart engine (get_provider() for ATP's AnalysisProvider)
+  chart_reader/        book-knowledge chart reader (get_reader(); prompts/ + strategies/ data; env ATP_CHART_READER_DIR)
 tests/                 package tests (today: the skeleton smoke test)
 fixtures/              (later) PR-2 goldens, same relative layout as ATP's tests expect (ATP_PRIVATE_FIXTURES)
 knowledge/             (later) the KB / method / Method Pack (PRIVATE_PACKAGE.md section 8)

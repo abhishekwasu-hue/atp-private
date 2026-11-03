@@ -3,6 +3,8 @@
 The Trade engine snapshot engine-snapshot-v2 (Trade commit 813358b) is imported under `atp_private/trade_engine/`
 (owner order M79, W1). Entry points for ATP's loaders:
 - `atp_private.chart_analyze.get_provider()`: the Analyze-a-chart provider (M79 W5), built on the snapshot's Method Pack.
+- `atp_private.chart_reader.get_reader()`: the book-knowledge chart reader (M86 W1): Abhi's method or one independent
+  book strategy, read with the caller's anthropic client.
 - `atp_private.trade_engine.get_provider()`: the signal-engine provider; its shim (EN-1) is not built yet, so it still
   fails closed with `EngineNotImported` and ATP's signal engine stays off.
 """
