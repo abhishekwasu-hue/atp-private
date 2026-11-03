@@ -24,7 +24,7 @@ from atp_private.trade_engine.vision import method_pack as _MP
 ENGINE_IMPORTED = True
 NAME = "atp-trade-engine"
 VERSION = "engine-snapshot-v2+813358b"
-PROMPT_VERSION = "atp_chart_image_v2"   # v2 (owner CA-D1/D2, 3 Nov): story by structure, no calendar words; stock volume; lengths
+PROMPT_VERSION = "atp_chart_image_v3"   # v3 (owner CA-Q3): choch line, last_price, RSI-pane divergence   # v2 (owner CA-D1/D2, 3 Nov): story by structure, no calendar words; stock volume; lengths
 
 
 @dataclass(frozen=True)
@@ -63,7 +63,8 @@ Coordinates: pixels of this image, x to the right, y down, 0 <= x <= WIDTH, 0 <=
 
 Keys (enum values exactly as written):
 {
- "recognised": {"symbol": str|null, "exchange": str|null, "timeframe": str|null, "first_bar": str|null, "last_bar": str|null},
+ "recognised": {"symbol": str|null, "exchange": str|null, "timeframe": str|null, "first_bar": str|null, "last_bar": str|null,
+                "last_price": number|null},       (the last candle's close read from the price axis)
  "story": [str, ...]                      (the chart's story from the left edge to the last candle, a few short paragraphs),
  "trend": {"side": "up"|"down"|"sideways"|"unclear", "text": str},
  "current_state": {"phase": "pullback"|"handover"|"commitment"|"trending"|"range"|"unclear", "text": str},
@@ -91,10 +92,14 @@ Keys (enum values exactly as written):
                       "rsi": {"x0": number, "y0": number, "x1": number, "y1": number}|null, "note": str} | null,
    "commitment_candle": {"x": number, "y": number, "note": str} | null,
    "ltf_choch": {"x": number, "y": number, "note": str} | null,
-   "setup_lines": [{"kind": "trigger"|"invalidation"|"next_area", "y": number, "price": number|null, "note": str}, ...]}
+   "setup_lines": [{"kind": "trigger"|"invalidation"|"next_area", "y": number, "price": number|null, "note": str}, ...],
+   "choch": {"x0": number, "y0": number, "x1": number, "y1": number, "price": number|null, "note": str} | null}
+     (the swing level whose close-through is the latest CHoCH, drawn from that swing to the breaking candle; null if none)
 }
 Required: story (at least one paragraph), trend.side, setup, scenarios.primary and scenarios.alternative.
 "what_to_wait_for" only when the setup is not formed.
+When an RSI pane is visible and a divergence is read, give "rsi_divergence.rsi" on the RSI line too (the two RSI
+points of the same two swings), so it is drawn in both panes.
 """
 
 TASK_TEXT = ("Read this chart image ({width} x {height} pixels) with the Method Pack and return the JSON object described "

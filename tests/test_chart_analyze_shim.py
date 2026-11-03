@@ -112,7 +112,8 @@ def test_format_text_owner_review_rules():
     words; lengths the server keeps."""
     import atp_private.chart_analyze as ca
     t = ca.FORMAT_TEXT
-    assert ca.PROMPT_VERSION == "atp_chart_image_v2"
+    assert ca.PROMPT_VERSION == "atp_chart_image_v3"
+    assert '"choch"' in t and '"last_price"' in t and 'rsi_divergence.rsi' in t
     assert "Tell the story by STRUCTURE only" in t and "Never a month, date, weekday, session or clock word" in t
     assert "never mention FACTS, OHLC text" in t
     assert "for a single stock read the" in t and "stock's own volume bars" in t
