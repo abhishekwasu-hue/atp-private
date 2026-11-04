@@ -76,8 +76,15 @@ def instrument_of(symbol):
     s = str(symbol or "").strip()
     if s.upper() in INS.REGISTRY:
         return s.upper()
-    key = s.replace(":", "|", 1)
-    return next((n for n, x in INS.REGISTRY.items() if x["key"].lower() == key.lower()), None)
+    key = _flat(s)
+    return next((n for n, x in INS.REGISTRY.items() if _flat(x["key"]) == key), None)
+
+
+def _flat(key):
+    """An instrument key in one spelling: the broker's ("NSE_INDEX|Nifty 50"), ATP's broker form ("NSE_INDEX:Nifty 50")
+    and ATP's lake key ("NSE_INDEX:NIFTY50", "NSE_INDEX:NIFTYBANK", "BSE_INDEX:SENSEX") are the same instrument."""
+    prefix, _, name = str(key).replace(":", "|", 1).partition("|")
+    return f"{prefix.upper()}|{name.replace(' ', '').upper()}"
 
 
 def _naive(t):
