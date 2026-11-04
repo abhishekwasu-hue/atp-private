@@ -10,6 +10,7 @@
   "bots_common/level_gate_bot.py",
   "bots_common/level_reaction.py",
   "bots_common/plain_text.py",
+  "bots_common/preopen_crux.py",
   "chart_reader/__init__.py",
   "chart_reader/evidence.py",
   "chart_reader/measures.py",
@@ -42,6 +43,7 @@
   "decision3/pa_evidence.py",
   "decision3/pa_frames.py",
   "decision3/patterns_pa.py",
+  "decision3/preopen_chart.py",
   "decision3/range_edges.py",
   "decision3/rsi_hidden.py",
   "decision3/rsi_push.py",
@@ -99,6 +101,7 @@
   "rsi2/engine.py",
   "rsi2/settings.py",
   "scripts/build_method_pack.py",
+  "scripts/level_gate_preopen.py",
   "swings2/__init__.py",
   "swings2/candles.py",
   "swings2/engine.py",
@@ -166,6 +169,7 @@
   "tests/test_pa_patterns.py",
   "tests/test_pa_range_edges.py",
   "tests/test_pa_volume_read.py",
+  "tests/test_preopen_charts.py",
   "tests/test_refined_origin_base.py",
   "tests/test_rsi_push.py",
   "tests/test_sw.py",
@@ -295,5 +299,16 @@
   "vision/engine_card.py",
   "vision/gap_context.py",
   "vision_led/charts.py"
- ]
+ ],
+ "added_later": {
+  "note": "owner 4 Nov (pre-open charts from ATP's job): copied from the same commit with the same import rewrite; preopen_chart.py carries three marked ATP display additions (phase in the title, the unfilled opening-gap band, the close word); test_preopen_charts.py without the four Trade-bot plumbing tests",
+  "modules": [
+   "bots_common/preopen_crux.py",
+   "decision3/preopen_chart.py",
+   "scripts/level_gate_preopen.py"
+  ],
+  "tests": [
+   "tests/test_preopen_charts.py"
+  ]
+ }
 }
