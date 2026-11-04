@@ -77,6 +77,11 @@ def test_instrument_names():
     assert PV.instrument_of("BSE_INDEX:SENSEX") == "SENSEX"
     assert PV.instrument_of("banknifty") == "BANKNIFTY"
     assert PV.instrument_of("NSE_EQ:INFY") is None
+    # ATP's lake keys (what the runner and the pre-open job hand in) are the same instruments
+    assert PV.instrument_of("NSE_INDEX:NIFTY50") == "NIFTY"
+    assert PV.instrument_of("NSE_INDEX:NIFTYBANK") == "BANKNIFTY"
+    assert PV.instrument_of("NSE_INDEX|Nifty 50") == "NIFTY"
+    assert PV.instrument_of("NSE_INDEX:NIFTYIT") is None
 
 
 # --------------------------------------------------------------------------- with the fixtures store
