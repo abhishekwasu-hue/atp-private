@@ -10,7 +10,11 @@ written here: this module adds only the answer format, which is ATP's generic ou
 - `parse_image_only(reply, width, height)`: the first JSON object in the reply (a fenced block is allowed). ATP's
   contract then validates it, filters every text and drops what does not fit; a reply without an object is an error,
   which ATP records as a failed analysis.
-- No hybrid entry point yet: ATP's hybrid mode then shows its own code reading ("Advanced analysis (code)").
+- `hybrid_instructions(width, height, facts)` / `parse_hybrid(reply, facts)` (owner 5 Nov: "Advanced analysis = code AND
+  AI"): ATP's code reads and draws the structure (exact prices); the model receives ATP's own chart picture and those
+  facts and writes the study in the Method Pack (story, state, setup, scenarios, what to wait for). Every price it gives
+  must be one of the facts' prices: any other price is removed in `parse_hybrid` (never a price invented or read from
+  a picture).
 
 The AI only describes the chart. It never places, blocks or changes an order (ADR-0006); this module has no order,
 broker or execution import.
@@ -105,6 +109,112 @@ points of the same two swings), so it is drawn in both panes.
 TASK_TEXT = ("Read this chart image ({width} x {height} pixels) with the Method Pack and return the JSON object described "
              "in the answer format. Describe only; ATP places no order from it.")
 
+HYBRID_PROMPT_VERSION = "atp_chart_hybrid_v1"
+
+HYBRID_FORMAT_TEXT = """\
+ANSWER FORMAT (ATP output contract, Advanced analysis). Reply with ONE JSON object and nothing else.
+
+How this works: ATP's code has already read the candles of this chart and drawn them in the picture you see. Its
+reading comes with the request as exact numbers (the structure per timeframe, the protected level, the last break of
+structure, the areas of interest above and below the last close, the swing levels). Your part is the STUDY: read that
+structure with the Method Pack above and write what a trader following the method studies next.
+
+Rules (always):
+- Every price you write must be one of the prices in ATP's reading (an area edge, a swing level, the protected level,
+  the last break, the last close). Never invent a price and never read one from the picture; when no price of the
+  reading fits, use null.
+- Structure words only. Never write buy, sell, target, stop-loss, entry advice, a recommendation or a guarantee.
+  Conditions only ("a close below the area would ...").
+- Evidence is listed, never scored: no score, probability or confidence number anywhere.
+- Tell the story by STRUCTURE only (swings HH / HL / LH / LL, impulses, corrections, areas, breaks, in the order they
+  happen). Never a month, date, weekday, session or clock word anywhere.
+- Write for the user: never mention ATP's reading, FACTS, JSON, prompts or the Method Pack by name.
+- Lengths (longer text is cut): each story paragraph and each scenario <= 550 characters; trend.text,
+  current_state.text, waiting_for and what_to_wait_for.condition <= 300; every evidence reason and next-area text <= 150;
+  names <= 70.
+- current_state.text starts with the direction price is moving now (up / down / sideways).
+
+Keys (enum values exactly as written):
+{
+ "story": [str, ...],
+ "trend": {"side": "up"|"down"|"sideways"|"unclear", "text": str},
+ "current_state": {"phase": "pullback"|"handover"|"commitment"|"trending"|"range"|"unclear", "text": str},
+ "rsi": {"divergence": "none", "text": ""},
+ "setup": {"side": "bull_put"|"bear_call"|"none", "label": "A"|"B"|null, "status": "formed"|"forming"|"none",
+           "waiting_for": str|null, "trigger": {"text": str, "price": number|null},
+           "invalidation": {"text": str, "price": number|null}, "next_areas": [{"text": str, "price": number|null}, ...]},
+ "evidence": [{"name": str, "present": true|false, "reason": str}, ...],
+ "scenarios": {"primary": str, "alternative": str, "primary_invalidated_at": {"text": str, "price": number|null}},
+ "what_to_wait_for": {"condition": str, "alert": {"kind": "above"|"below", "price": number}
+                      | {"kind": "between", "low": number, "high": number} | null} | null
+}
+Required: story (at least one paragraph), trend.side, setup, scenarios.primary and scenarios.alternative.
+"what_to_wait_for" only when the setup is not formed.
+"""
+
+HYBRID_TASK_TEXT = ("This picture ({width} x {height} pixels) is ATP's chart of {symbol} on the {timeframe} candles. ATP's reading "
+                    "of it, exact numbers:\n{reading}\nWrite the study as the JSON object described in the answer format. "
+                    "Describe only; ATP places no order from it.")
+
+FACT_KEYS = ("symbol", "timeframe", "last_close", "timeframes", "protected", "last_break", "areas", "levels", "trigger_candle")
+PRICE_TOLERANCE = 0.0005          # a written price within 0.05 % of one of the reading's prices is that price
+
+
+def hybrid_reading(facts):
+    """ATP's reading as the model sees it: the structure facts only (the candles are in the picture), compact JSON."""
+    return json.dumps({k: facts.get(k) for k in FACT_KEYS if facts.get(k) is not None}, separators=(",", ":"), default=str)
+
+
+def fact_prices(facts):
+    """Every price of ATP's reading: the last close, the protected level, the last break, each area's edges, each level."""
+    out = []
+
+    def add(v):
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            out.append(float(v))
+    add(facts.get("last_close"))
+    add(facts.get("protected"))
+    add((facts.get("last_break") or {}).get("price"))
+    for a in facts.get("areas") or ():
+        add(a.get("low"))
+        add(a.get("high"))
+    for lv in facts.get("levels") or ():
+        add(lv.get("price"))
+    for row in facts.get("timeframes") or ():
+        add(row.get("protected"))
+        add((row.get("last_break") or {}).get("price"))
+    return sorted(set(out))
+
+
+def keep_known_prices(raw, prices):
+    """The reply with every price that is not one of the reading's prices set to null (an alert with an unknown price is
+    dropped). Changes the dict in place and returns it."""
+    def known(v):
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            return False
+        return any(abs(float(v) - p) <= p * PRICE_TOLERANCE for p in prices)
+
+    def ref(r):
+        if isinstance(r, dict) and r.get("price") is not None and not known(r.get("price")):
+            r["price"] = None
+    setup = raw.get("setup") if isinstance(raw.get("setup"), dict) else {}
+    ref(setup.get("trigger"))
+    ref(setup.get("invalidation"))
+    for n in setup.get("next_areas") or ():
+        ref(n)
+    scen = raw.get("scenarios") if isinstance(raw.get("scenarios"), dict) else {}
+    ref(scen.get("primary_invalidated_at"))
+    wait = raw.get("what_to_wait_for") if isinstance(raw.get("what_to_wait_for"), dict) else None
+    if wait is not None and isinstance(wait.get("alert"), dict):
+        al = wait["alert"]
+        vals = [al.get("price")] if al.get("kind") in ("above", "below") else [al.get("low"), al.get("high")]
+        if not all(known(v) for v in vals):
+            wait["alert"] = None
+    for k in ("annotations", "recognised", "key_levels", "htf_context"):        # code draws and reads these in hybrid
+        raw.pop(k, None)
+    return raw
+
+
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S | re.I)
 
 
@@ -125,6 +235,19 @@ class Provider:
 
     def parse_image_only(self, reply: str, *, width: int, height: int) -> dict:
         return parse_json(reply)
+
+    # --- Advanced analysis (code + AI): ATP's code reading, the model's study on top -----------------------------------
+    def hybrid_instructions(self, *, width: int, height: int, facts: dict) -> Instructions:
+        system = self._pack.rstrip() + "\n\n" + HYBRID_FORMAT_TEXT
+        user = HYBRID_TASK_TEXT.format(width=int(width), height=int(height), symbol=facts.get("symbol") or "this symbol",
+                                       timeframe=facts.get("timeframe") or "", reading=hybrid_reading(facts))
+        return Instructions(system=system, user=user, prompt_version=f"{HYBRID_PROMPT_VERSION}+pack-{self.method_version}")
+
+    def parse_hybrid(self, reply: str, *, facts: dict) -> dict:
+        raw = keep_known_prices(parse_json(reply), fact_prices(facts))
+        raw.setdefault("version", VERSION)
+        raw.setdefault("method_version", self.method_version)
+        return raw
 
 
 def parse_json(reply):
