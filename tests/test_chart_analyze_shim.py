@@ -24,7 +24,7 @@ def test_provider_interface():
     for attr in ("name", "version", "method_version"):
         assert isinstance(getattr(p, attr), str) and getattr(p, attr)
     assert callable(p.image_only_instructions) and callable(p.parse_image_only)
-    assert not hasattr(p, "hybrid_instructions")          # no hybrid entry point yet: ATP shows its code reading
+    assert callable(p.hybrid_instructions) and callable(p.parse_hybrid)    # owner 5 Nov: Advanced = code + AI
 
 
 def test_instructions_hold_the_method_pack_as_is():
@@ -94,7 +94,7 @@ def test_atp_loader_accepts_the_provider():
         eng = P.load()
         assert eng is not None, P.reason()
         assert P.describe(admin=True)["installed"] is True
-        assert P.supports_hybrid(eng) is False
+        assert P.supports_hybrid(eng) is True
     finally:
         P.reset_for_tests()
 
@@ -118,3 +118,50 @@ def test_format_text_owner_review_rules():
     assert "never mention FACTS, OHLC text" in t
     assert "for a single stock read the" in t and "stock's own volume bars" in t
     assert "<= 550 characters" in t and "<= 300" in t and "<= 40" in t
+
+
+FACTS = {"symbol": "NIFTY 50", "timeframe": "1h", "as_of": "x", "last_close": 24101.0, "protected": 23980.0,
+         "last_break": {"price": 24150.0, "kind": "bos"}, "areas": [{"where": "above", "low": 24300.0, "high": 24340.0},
+                                                                     {"where": "below", "low": 23860.0, "high": 23900.0}],
+         "levels": [{"kind": "swing high", "price": 24260.0}], "timeframes": [], "trigger_candle": None,
+         "bars": [{"t": 1, "o": 1, "h": 2, "l": 0.5, "c": 1.5}] * 50, "chart": {"width": 960, "height": 540}}
+
+HYBRID_REPLY = {"story": ["The up structure made a higher high, then a pullback."], "trend": {"side": "up", "text": "Up."},
+                "current_state": {"phase": "pullback", "text": "Down - pullback toward the area below."},
+                "rsi": {"divergence": "none", "text": ""},
+                "setup": {"side": "bull_put", "label": "A", "status": "forming", "waiting_for": "a handover at the area",
+                          "trigger": {"text": "commitment close above", "price": 24150.0},
+                          "invalidation": {"text": "close below protected", "price": 23981.0},
+                          "next_areas": [{"text": "made-up", "price": 25555.0}, {"text": "swing high", "price": 24260.0}]},
+                "evidence": [{"name": "Trend", "present": True, "reason": "HH and HL"}],
+                "scenarios": {"primary": "Pullback holds the area.", "alternative": "A close below the protected level.",
+                              "primary_invalidated_at": {"text": "protected", "price": 12345.0}},
+                "what_to_wait_for": {"condition": "price at the area", "alert": {"kind": "between", "low": 23860.0, "high": 23900.0}},
+                "annotations": {"swings": []}}
+
+
+def test_hybrid_instructions_carry_the_pack_and_the_reading_not_the_candles():
+    p = CA.get_provider()
+    ins = p.hybrid_instructions(width=960, height=540, facts=FACTS)
+    assert ins.system.startswith(MP.load()[0].rstrip()[:200]) and "ANSWER FORMAT (ATP output contract, Advanced analysis)" in ins.system
+    assert ins.prompt_version.startswith("atp_chart_hybrid_v1+pack-")
+    assert '"last_close":24101.0' in ins.user and '"bars"' not in ins.user and "NIFTY 50" in ins.user
+    assert "places no order" in CA.HYBRID_TASK_TEXT and "Never write buy, sell, target, stop-loss" in CA.HYBRID_FORMAT_TEXT
+
+
+def test_parse_hybrid_keeps_only_the_readings_prices():
+    out = CA.get_provider().parse_hybrid(json.dumps(HYBRID_REPLY), facts=FACTS)
+    s = out["setup"]
+    assert s["trigger"]["price"] == 24150.0 and s["invalidation"]["price"] == 23981.0          # within 0.05 % of 23,980
+    assert [n["price"] for n in s["next_areas"]] == [None, 24260.0]                            # an invented price is removed
+    assert out["scenarios"]["primary_invalidated_at"]["price"] is None
+    assert out["what_to_wait_for"]["alert"] == {"kind": "between", "low": 23860.0, "high": 23900.0}
+    assert "annotations" not in out and out["version"] and out["method_version"]
+
+
+def test_a_hybrid_reply_passes_atp_contract():
+    _atp()
+    from app.chart_analyze import contract
+    raw = CA.get_provider().parse_hybrid(json.dumps(HYBRID_REPLY), facts=FACTS)
+    out = contract.validate(raw, mode="hybrid", width=960, height=540)
+    assert out["story"] and out["setup"]["status"] == "forming" and out["coordinate_space"] == "time_price"
