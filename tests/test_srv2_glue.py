@@ -36,8 +36,6 @@ def env(tmp_path, monkeypatch):
         token=lambda: "tok",
         option_chain=lambda tok, sym, idx: (chain(), ""),
         option_expiries=lambda tok, sym: ["2026-11-18", "2026-11-25"],
-        has_open=lambda sym, src: state.open_now,
-        open_trade=lambda tok, sym, sr, **kw: (state.opened.append({"symbol": sym, "legs": sr, **kw}) or (True, "opened")),
         send=lambda msg, **kw: (state.sent.append(msg) or True),
         live_confirmed=lambda *a: state.live_ok,
     )
@@ -89,7 +87,9 @@ def run(state, gate_fn, now=NOW, symbol="NIFTY", lot_size=65):
     from atp_private.trade_engine import cloud_db
     from atp_private.trade_engine.paper import engine_entry as EE
     st = cloud_db.get_strategy_settings(S.STRATEGY_KEY, symbol)
-    return EE.process(BOT, "tok", symbol, st, lot_size, SRC, now=now, gate_fn=gate_fn)
+    return EE.process(BOT, "tok", symbol, st, lot_size, SRC, now=now, gate_fn=gate_fn,
+                      has_open=lambda sym, src: state.open_now,          # Trade's database / trading_engine stand-ins (the PAPER engine
+                      open_fn=lambda tok, sym, sr, **kw: (state.opened.append({"symbol": sym, "legs": sr, **kw}) or (True, "opened")))
 
 
 def test_settings_are_trades_defaults_merged_with_the_stored_row(env):
@@ -199,10 +199,10 @@ def test_a_symbol_outside_the_signal_symbols_gets_no_entry(env):
 
 
 def test_an_adapter_atp_has_not_registered_means_no_entry_never_a_crash(env):
-    host.register(open_trade=None)
+    host.register(option_chain=None)
     store_row([entry("E1")])
     msg = run(env, gate())
-    assert "no position" in msg and not env.opened
+    assert "no entry" in msg and not env.opened
 
 
 def test_the_copied_glue_is_trades_code_with_only_the_imports_rewritten():
@@ -216,7 +216,7 @@ def test_the_copied_glue_is_trades_code_with_only_the_imports_rewritten():
     from scripts import engine_closure as EC
     man = json.loads(_read(os.path.join(ENGINE, "IMPORT_MANIFEST.json")))
     tops = EC.top_modules(src)
-    for rel in man["added_later"]["srv2_glue"]["modules"]:
+    for rel in man["added_later"]["srv2_glue"]["modules"] + man["added_later"]["srv2_engine"]["modules"]:
         want = AIR.rewrite(_read(os.path.join(src, rel)), tops, src)
         assert _read(os.path.join(ENGINE, rel)) == want, rel
 

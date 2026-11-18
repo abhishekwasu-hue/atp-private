@@ -27,6 +27,22 @@ reads the owner's own method, so it is owner-only (ATP DECISIONS 15 Nov, chart r
   model, PAPER only, signal symbols, legs = Trade's own `select_*` on the same chain); with `TRADE_SRC` set, every copied file equals
   Trade's after the same import rewrite, and the defaults equal Trade's.
 
+## P1b (Trade's PAPER engine, OPEN_QUESTIONS SRV2-Q1 default A)
+
+- Copied AS IS (same tool, group `srv2_engine`, 20 modules): `trading_engine`, `database`, `trade_monitor`, `order_safety`,
+  `entry_inflight`, `carry_guard`, `exit_price_fallback`, `monitor_timing`, `charges`, `log_setup`, `process_lock`, `order_execution`,
+  `engine_service`, `oi_analysis`, `paper/watch`, `paper/journal`, `mcx_contract_specs`, `mcx_quantity_check`, `notify_policy`,
+  `read_cache`. The bot's positions live in Trade's own SQLite store (`live_trades`) under `SRV2_DATA_DIR` on ATP's data volume.
+- `atp_private/adapters/trade_config.py`: Trade config's operational constants and market-hours functions added verbatim (the engine
+  never reads them; the engine's own values are unchanged).
+- `atp_private/srv2/io/`: stand-ins for Trade's IO modules - `cloud_db` (defaults + getters verbatim; rows from ATP), `upstox_api`
+  (ATP's Upstox app through ATP's budget; PAPER fill verbatim; LIVE refused), `notifications` (Telegram through ATP; texts, policy,
+  cool-down verbatim), `broker_factory` (none), `classic_sr_reversal_trader` / `signals` (the one function used, verbatim).
+- What ATP must register: settings, signal_symbols, token, option_chain, option_expiries, ltp, funds (Trade's kill switch needs the
+  capital, PAPER too), option_greeks, send, live_confirmed. `next level` finds no level for engine positions, as in Trade.
+- Tests `tests/test_srv2_engine.py`: entry -> two PAPER positions in Trade's store; the spread closes at PREMIUM_TARGET; a spot fall
+  stops it out (SL); nothing moves -> nothing closes; a LIVE order is refused. Exit clock fixed at 10:30 IST.
+
 ## Next
 
 P1b ATP: the owner-only "SRv2 bot" deployment, the adapters (Upstox chain / expiries through the broker budget, the owner's open
