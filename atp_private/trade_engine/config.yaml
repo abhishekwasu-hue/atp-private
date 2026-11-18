@@ -1,0 +1,15 @@
+# Copied from Trade config.yaml at the snapshot commit (lines 94-107: the paper section + error_alert_cooldown_min) for atp_private/trade_engine/paper/config.py (owner 18 Nov, SRV2). PAPER_CONFIG / PAPER_LOCAL_CONFIG / PAPER_DATA_DIR override it on the host.
+paper:
+  instruments:                 # enabled: false ⇒ त्या symbol वर PAPER entry नाही (approval मार्गही नाही)
+    NIFTY: {enabled: true, lot_size_fallback: 65}        # lot size Upstox instrument master मधून; हा फक्त fallback (जुळलं नाही ⇒ Telegram इशारा)
+    BANKNIFTY: {enabled: false, lot_size_fallback: 30}
+    SENSEX: {enabled: false, lot_size_fallback: 20}
+  update_every_min: 30         # उघड्या PAPER trade चा P&L Telegram वर दर इतक्या मिनिटांनी
+  fill_details: false          # N6: PAPER fill = एक ओळ; true ⇒ आधीचा पूर्ण card (legs / exits / Vision)
+  status_updates: false        # N6 (30 Oct): उघड्या trade चा P&L status Telegram वर नाही (EOD digest मध्ये); true ⇒ खालच्या वेळी
+  status_digest_times: ["10:30", "12:30", "14:30"]   # M53 MS-5: उघड्या trade चा P&L status फक्त या वेळी (दर slot ला एकदा); रिकामं [] ⇒ जुनं: दर update_every_min ला
+  near_alert_pct: 80           # SL / target च्या इतक्या % जवळ पोचला ⇒ एकदा इशारा
+  entry_cutoff: "14:45"        # /paper आणि engine मार्ग: यानंतर नवीन entry नाही (bots सारखंच; EOD square-off जवळ)
+  watch_min_interval_sec: 15   # PAPER watcher (updates / journal / manual spot SL-T) कमाल इतक्या सेकंदांनी एकदा — फक्त cron monitor loop मधून, stream मधून नाही
+
+error_alert_cooldown_min: 60   # M53 MS-2: same (script, first error line) Telegram alert at most once per this many minutes
