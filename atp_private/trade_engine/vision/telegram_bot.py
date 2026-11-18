@@ -1,0 +1,328 @@
+"""vision/telegram_bot.py — Telegram inbound (V1): Approve / Reject बटणं आणि commands. Long-polling (`getUpdates`), webhook नाही
+(VPS वर port उघडायचा नाही). systemd service म्हणून: `python3 -m vision.telegram_bot`.
+
+🎓 Security:
+  • `chat.id` **आणि** `from.id` दोन्ही `TELEGRAM_APPROVER_IDS` (env, comma) मध्ये हवेत — नाहीतर दुर्लक्ष (नोंद).
+  • Callback data = v1|signal_id|A/R|HMAC(VISION_CALLBACK_SECRET) — बदललेला / खोटा ⇒ नकार.
+  • निर्णय conditional (`status = PENDING_HUMAN` असेल तरच) ⇒ दुसऱ्यांदा / replay ⇒ "आधीच ठरलं". Deadline नंतर ⇒ "मुदत संपली".
+  • Service सुरू होताना उघडे PENDING_HUMAN ⇒ EXPIRED (restart नंतर जुना approve चालत नाही).
+  • Token / secret कधीच print नाहीत. फक्त PAPER bots (LIVE ला vision off). Exits ला यातलं काहीच लागत नाही.
+Review replies (फक्त approver): K-10 / gallery संदेशाला "✔" / "✘ कारण" / "सुटलेला trade HH:MM bear" ⇒ backtest_review (backtest_review/telegram.py).
+Commands (फक्त approver): /pending · /today · /vision <off|shadow|notify|auto_veto|confirm|veto_then_confirm> <bot> ·
+/status · /positions · /pause · /resume (paper/commands.py; pause फक्त नवे entries — exits नेहमी चालू) ·
+/paper <instrument> <bullput|bearcall> [short/hedge] SL <spot> [T <spot>] (✋ manual — paper/manual.py; Vision ⇒ ✅ / ❌ ⇒ PAPER) · /help
+✋ manual signal ला ✅ ⇒ लगेच entry प्रयत्न (paper.manual.execute_ready; gate चं APPROVED → EXECUTED conditional ⇒ एकदाच); प्रत्येक poll नंतर sweep
+(timeout / नाकार / मुदत ⇒ manual बंद).
+Abhi §10 (vision/approval.py): ✏️ Modify (फक्त entry, "entry 22590" ⇒ सुधारित ticket ⇒ पुन्हा ✅) · ❌ नंतर कारण (एक tap / other ⇒ मजकूर) ·
+📝 Correct marking (engine ला लागू नाही) · /correct [signal_id] · /exit <id> (फक्त PAPER, लगेच बंद — pause कधीच अडवत नाही).
+"""
+import argparse
+import json
+import sys
+import time
+
+import pandas as pd
+
+from . import approval as AP
+from . import config as VC
+from . import decide as VD
+from . import notify as VN
+from . import store as VS
+from . import tg as TG
+
+MODE_ALIAS = {"veto": "auto_veto", "confirm": "human_confirm", "vtc": "veto_then_confirm"}
+
+
+def expire_on_restart(path=None):
+    n = 0
+    for r in VS.rows_with_status("PENDING_HUMAN", path):
+        if VS.transition(r["signal_id"], "PENDING_HUMAN", "EXPIRED", path, decided_at=VS._iso(VS.now_ist()), decided_by="restart",
+                         decision_reason="service restart ⇒ old pending decision cancelled", transition_notified=1):
+            n += 1                                                       # T-1: card पुसत नाही — ओळ जोडून + नवा संदेश (worker पुन्हा नाही)
+            line = VN.restart_line()
+            VN.post(r, "restart", line, f"{VN.where(r)}: {line}", path)
+    return n
+
+
+def _authorized(upd_from, chat):
+    ids = VD.approver_ids()
+    return bool(ids) and str((upd_from or {}).get("id")) in ids and str((chat or {}).get("id")) in ids
+
+
+def _manual_sweep(path=None, only_signal=None, send=None):
+    try:
+        from atp_private.trade_engine.paper import manual as PM
+        return PM.execute_ready(send=send or TG.send_text, vpath=path, only_signal=only_signal)
+    except Exception as exc:
+        print(f"⚠️ manual sweep: {type(exc).__name__}: {exc}")
+        return []
+
+
+def handle_callback(cq, path=None, now=None, answer=None, edit=None, execute_send=None, send=None, send_buttons=None, send_reply=None):
+    """रिटर्न (ok, संदेश). answer / edit / send / send_buttons / send_reply injectable (tests). edit = (message_id, original_caption, line)
+    — default `TG.append_outcome` (T-1: card कधीच पुसत नाही); send_reply = card ला उत्तर म्हणून नवा संदेश."""
+    answer = answer or TG.answer_callback
+    edit = edit or TG.append_outcome
+    msg = cq.get("message") or {}
+    if not _authorized(cq.get("from"), msg.get("chat")):
+        answer(cq.get("id"), "Not allowed")
+        return False, "unauthorized"
+    parsed = VD.parse_callback(cq.get("data"))
+    if parsed is None:
+        answer(cq.get("id"), "Invalid button")
+        return False, "bad_hmac"
+    sid, action = parsed
+    row = VS.get_signal(sid, path)
+    if row is None:
+        answer(cq.get("id"), "Signal not found")
+        return False, "missing"
+    now = pd.Timestamp(now or VS.now_ist())
+    uid = str((cq.get("from") or {}).get("id"))
+    if action == "D":                                                    # N2: 📎 the details on tap (once per card), status untouched
+        return show_details(row, answer, cq.get("id"), send_reply, path)
+    if action == "C":                                                    # 📝 approve असो वा नसो — status ला हात नाही
+        return AP.start_correction(row, uid, answer, cq.get("id"), send, path, now)
+    if action in VD.REJECT_REASONS:                                      # ❌ नंतरचं कारण (एक tap)
+        return AP.set_reason(row, action, uid, answer, cq.get("id"), edit, msg.get("message_id"), send, path, now)
+    if row["status"] != "PENDING_HUMAN":
+        answer(cq.get("id"), f"Already decided: {row['status']}")
+        return False, "already"
+    if row.get("deadline") and pd.Timestamp(row["deadline"]) <= now:
+        answer(cq.get("id"), "Time is up")
+        return False, "expired"
+    if action == "M":                                                    # ✏️ फक्त entry — मजकूर उत्तराची वाट (AP.handle_text)
+        return AP.start_modify(row, uid, answer, cq.get("id"), send, path, now)
+    who = f"telegram:{(cq.get('from') or {}).get('id')}"
+    if action == "A":
+        f = 1.0                                                          # M56 V1 (C1): your ✅ = the dashboard lots (never a Vision factor)
+        lim = row.get("mod_entry")
+        why = "you approved (dashboard lots)" + (f" · ✏️ limit entry {float(lim):g}" if lim is not None else "")
+        ok = VS.transition(sid, "PENDING_HUMAN", "APPROVED", path, factor=f, human_decision="approve", human_ts=VS._iso(now),
+                           decided_at=VS._iso(now), decided_by=who, decision_reason=why)
+        text = VN.approved_line(now, f, lim)
+        kind = "approved"
+    else:
+        ok = VS.transition(sid, "PENDING_HUMAN", "REJECTED", path, factor=0.0, human_decision="reject", human_ts=VS._iso(now),
+                           decided_at=VS._iso(now), decided_by=who, decision_reason="you rejected")
+        try:
+            appr = VC.approval_required(VC.load(row.get("bot"), path), row.get("trading_mode") or "PAPER")
+        except Exception:                                                # noqa: BLE001 — display only
+            appr = True
+        text = VN.rejected_line(now, appr)
+        kind = "rejected"
+    if not ok:
+        answer(cq.get("id"), "Already decided")
+        return False, "race"
+    apply_to_members(row, action, now, path, who=who)                    # N4: the card's other models (same area visit)
+    answer(cq.get("id"), text if action == "A" else f"❌ Rejected {now:%H:%M} ⇒ trade NOT taken")
+    line = f"{text} · {VN.where(row)}"                                   # T-1: मूळ card + ही ओळ (बटणं निर्णयानंतरच जातात) + नवा संदेश
+    VN.post(row, kind, line, line, path, append=edit, send_reply=send_reply)
+    if action == "R":                                                    # Abhi §10b: कारण एक tap (निर्णय आधीच लागू — position नाही)
+        AP.prompt_reason(row, send_buttons)
+    if row.get("bot") == "manual":                                       # ✋ /paper: bot cycle नाही ⇒ इथेच (✅ ⇒ entry, ❌ ⇒ बंद)
+        _manual_sweep(path, only_signal=sid, send=execute_send)
+    elif action == "A":                                                  # Abhi: ✅ ⇒ the PAPER entry at once, not on the bot's next minute
+        _engine_enter_now(row, send=execute_send)
+    return True, text
+
+
+def _model_prefix(row):
+    """Engine entry model signal ⇒ "E1 — Aggressive · " (four cards on one area stay apart); any other signal ⇒ "". Never raises."""
+    try:
+        from atp_private.trade_engine.vision import card_summary as CS
+        from atp_private.trade_engine.vision.gate import _row_tags
+        ml = CS.model_label(_row_tags(row))
+        return f"{ml} · " if ml else ""
+    except Exception:                                                    # noqa: BLE001
+        return ""
+
+
+def _engine_enter_now(row, send=None, enter_fn=None):
+    """✅ on an engine signal of a bot listed in `paper.engine_entry.BOT_SETTINGS_KEY` ⇒ its engine cycle now (same lock as the cron
+    cycle ⇒ one entry). A TEST / dry-run row is the test runner's own (it opens the order itself) ⇒ skipped here. Never raises."""
+    try:
+        from atp_private.trade_engine.vision.gate import _row_tags
+        tags = _row_tags(row)
+        if tags.get("dry_run") or not tags.get("engine"):
+            return None
+        if enter_fn is None:
+            from atp_private.trade_engine.paper import engine_entry as EE
+            enter_fn = EE.enter_now
+        return enter_fn(row.get("bot"), row.get("symbol"), send=send or (lambda m: VN.post(row, "paper_entry", m)))   # N2: on the card
+    except Exception as exc:                                             # noqa: BLE001
+        print(f"⚠️ engine enter on ✅: {type(exc).__name__}: {exc}")
+        return None
+
+
+def apply_to_members(lead, action, now, path=None, who=None, only=None):
+    """N4 (30 Oct): the card's ✅ / ❌ also decides its member signals (the other entry models of the same area visit, grouped by
+    worker.join_card) — each as if its own card had been tapped (still PENDING_HUMAN only; one position at a time stays the bot's rule).
+    Returns the member ids changed. Never raises."""
+    out = []
+    try:
+        import json as _json
+        mem = only if only is not None else _json.loads(VS.kv_get(f"tg_members:{lead['signal_id']}", path) or "[]")
+        who = who or f"card:{lead['signal_id']}"
+        for m in mem:
+            r = VS.get_signal(m, path)
+            if not r or r["status"] != "PENDING_HUMAN":
+                continue
+            if action == "A":
+                ok = VS.transition(m, "PENDING_HUMAN", "APPROVED", path, factor=1.0, human_decision="approve", human_ts=VS._iso(now),
+                                   decided_at=VS._iso(now), decided_by=who, decision_reason=f"✅ on the area-visit card ({lead['signal_id']})")
+            else:
+                ok = VS.transition(m, "PENDING_HUMAN", "REJECTED", path, factor=0.0, human_decision="reject", human_ts=VS._iso(now),
+                                   decided_at=VS._iso(now), decided_by=who, decision_reason=f"❌ on the area-visit card ({lead['signal_id']})")
+            if ok:
+                out.append(m)
+    except Exception as exc:                                             # noqa: BLE001
+        print(f"⚠️ card members: {type(exc).__name__}: {exc}")
+    return out
+
+
+def show_details(row, answer, cq_id, send_reply=None, path=None):
+    """N2 (30 Oct): 📎 Details ⇒ the card's full details as a reply under it (once; a second tap only answers), with ✏️ / 📝 on it."""
+    sid = row["signal_id"]
+    key = f"tg_details:{sid}"
+    if VS.kv_get(key, path):
+        answer(cq_id, "📎 details are already under the card")
+        return True, "details_again"
+    VS.kv_set(key, VS._iso(VS.now_ist()), path)
+    from . import worker as VW
+    try:
+        res = json.loads(row.get("vision_json") or "{}") if isinstance(row.get("vision_json"), str) else (row.get("vision_json") or {})
+    except ValueError:
+        res = {}
+    mid = row.get("tg_message_id")
+    parts = VW.details_parts(VW.engine_details(row, res, None, row.get("deadline")))
+    modify = AP.base_levels(row) is not None
+    btn = AP.details_buttons(sid, modify) if row.get("status") == "PENDING_HUMAN" else None
+    for i, p in enumerate(parts):
+        last = btn if i == len(parts) - 1 else None
+        if send_reply is not None:
+            send_reply(mid, p, buttons=last)
+        else:
+            TG.reply(mid, p, buttons=last)
+    answer(cq_id, "📎 details below the card")
+    return True, "details"
+
+
+def handle_command(text, from_, chat, path=None, send=None, trading_mode_fn=None):
+    send = send or TG.send_text
+    if not _authorized(from_, chat):
+        return False, "unauthorized"
+    parts = (text or "").strip().split()
+    cmd = parts[0].split("@")[0].lower() if parts else ""
+    if cmd == "/pending":
+        rows = VS.rows_with_status(("QUEUED", "RUNNING", "PENDING_HUMAN", "APPROVED", "REJECTED"), path)
+        lines = [f"{VS.mark_test(r)}{r['signal_ts'][11:16]} {r['bot']} {_model_prefix(r)}{r['symbol']} {r['direction']} L{float(r['level'] or 0):,.0f} → {r['status']}"
+                 + (f" (⏱ {r['deadline'][11:16]})" if r.get("deadline") and r["status"] == "PENDING_HUMAN" else "") for r in rows]
+        send("⏳ <b>Open signals</b>\n" + ("\n".join(lines) if lines else "none"))
+        return True, "pending"
+    if cmd == "/today":
+        day = VS.now_ist().strftime("%Y-%m-%d")
+        rows = VS.real_signals(VS.list_signals(day, path))               # M54 V-8: TEST rows are not counted
+        by = {}
+        for r in rows:
+            by[r["status"]] = by.get(r["status"], 0) + 1
+        u = VS.usage_summary(day, path)
+        try:                                                             # entry models E1–E4 (no activity ⇒ "" ⇒ today's text)
+            from atp_private.trade_engine.paper import engine_entry as EE
+            mline = EE.models_summary_text(day, vpath=path)
+        except Exception:                                                # noqa: BLE001 — display only
+            mline = ""
+        send(f"📊 <b>Today</b>: signals {len(rows)} · " + ", ".join(f"{k} {v}" for k, v in sorted(by.items()))
+             + f"\nVision calls: {u['calls']}" + (f"\n{mline}" if mline else ""))
+        return True, "today"
+    if cmd == "/vision":
+        if len(parts) != 3:
+            send("Usage: /vision &lt;off|shadow|notify|veto|confirm|vtc&gt; &lt;bot&gt;")
+            return False, "usage"
+        mode, bot = MODE_ALIAS.get(parts[1].lower(), parts[1].lower()), parts[2]
+        try:
+            VC.save(bot, {"vision_mode": mode}, f"telegram:{(from_ or {}).get('id')}", path, trading_mode_fn=trading_mode_fn)
+        except ValueError as exc:
+            send(f"❌ {exc}")
+            return False, str(exc)
+        send(f"✅ {bot}: Vision = {VC.MODE_EN.get(mode, mode)}")
+        return True, mode
+    if cmd == "/help":
+        from atp_private.trade_engine.paper import manual as PM
+        send(PM.HELP)
+        return True, "help"
+    if cmd == "/paper":                                                  # ✋ Abhi (Monday PAPER) — paper/manual.py
+        from atp_private.trade_engine.paper import manual as PM
+        try:
+            return PM.handle(text, f"telegram:{(from_ or {}).get('id')}", send, vpath=path)
+        except Exception as exc:
+            send(f"❌ /paper: {type(exc).__name__}: {exc}")
+            return False, str(exc)
+    if cmd == "/cancel":                                                 # ✏️ / 📝 / ❌ कारण ची वाट रद्द
+        AP.state_clear(str((from_ or {}).get("id")), path)
+        send("Cancelled — nothing changed.")
+        return True, "cancel"
+    if cmd == "/correct":                                                # 📝 (बटणं गेल्यावरही) — vision/approval.py
+        return AP.start_correction_cmd(text, str((from_ or {}).get("id")), send, path)
+    if cmd in ("/status", "/positions", "/pause", "/resume", "/exit"):  # Abhi (Monday PAPER) — paper/commands.py
+        from atp_private.trade_engine.paper import commands as PCMD
+        try:
+            return PCMD.handle(cmd, f"telegram:{(from_ or {}).get('id')}", send, arg=" ".join(parts[1:]))
+        except Exception as exc:
+            send(f"❌ {cmd}: {type(exc).__name__}: {exc}")
+            return False, str(exc)
+    return False, "unknown"
+
+
+def poll_once(offset, path=None, timeout=50):
+    """एक getUpdates फेरी. रिटर्न पुढचा offset."""
+    VN.listener_seen(path)                                               # T-1: bot health ओळीसाठी listener ची शेवटची poll
+    for u in TG.get_updates(offset, timeout):
+        offset = max(offset, int(u.get("update_id", 0)) + 1)
+        try:
+            if "callback_query" in u:
+                handle_callback(u["callback_query"], path)
+            elif "message" in u:
+                m = u["message"]
+                if str(m.get("text", "")).startswith("/"):
+                    handle_command(m["text"], m.get("from"), m.get("chat"), path)
+                elif m.get("text") and AP.handle_text(m, _authorized, path)[1] not in AP.NOT_MINE:   # ✏️ entry / 📝 / ❌ कारण (state असेल तरच)
+                    pass
+                elif m.get("reply_to_message"):                          # review charts (K-10 / gallery) ला ✔ / ✘ reply ⇒ backtest_review
+                    from atp_private.trade_engine.backtest_review import telegram as RT
+                    RT.handle_reply(m, _authorized, send=TG.send_text)
+        except Exception as exc:                                         # एका update ची चूक service थांबवत नाही
+            print(f"⚠️ update {u.get('update_id')}: {type(exc).__name__}: {exc}")
+        VS.kv_set("tg_offset", offset, path)
+    _manual_sweep(path)                                                  # ✋ manual: ✅ नंतरचा entry / timeout / नाकार (idempotent)
+    return offset
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    a = ap.parse_args(argv)
+    if not VD.secret() or not VD.approver_ids():
+        print("❌ VISION_CALLBACK_SECRET आणि TELEGRAM_APPROVER_IDS env हवेत — service सुरू नाही")
+        return 1
+    from atp_private.trade_engine.process_lock import ProcessLock, ProcessLockHeld
+    try:
+        with ProcessLock("vision_telegram"):
+            n = expire_on_restart()
+            print(f"vision telegram service सुरू — restart मुळे {n} pending रद्द")
+            ok, why = TG.can_ask()
+            if not ok:                                                   # बटणं पाठवली जाणार नाहीत ⇒ प्रत्येक signal skip — मोठ्याने सांगा (दिवसातून एकदा)
+                print(f"⚠️ {why}")
+                VN.can_ask_alert(why)
+            offset = int(VS.kv_get("tg_offset") or 0)
+            while True:
+                offset = poll_once(offset)
+                if a.once:
+                    break
+                time.sleep(0.5)
+    except ProcessLockHeld:
+        print("⏭️ vision telegram service आधीच चालू आहे")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

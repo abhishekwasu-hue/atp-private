@@ -25,6 +25,13 @@ ENGINE_NOTE = ("owner 18 Nov (SRV2, OPEN_QUESTIONS SRV2-Q1 default A): Trade's P
 RUNNER_MODULES = ("scripts/engine_signal_run.py", "scripts/engine_resident.py")
 RUNNER_NOTE = ("owner 18 Nov (SRV2): the engine's run path (engine_signal_run.main per symbol, engine_resident's close / due / window "
                "functions) copied AS IS; atp_private.srv2.runner calls them in-process at each 5M close instead of Trade's cron")
+VISION_MODULES = ("vision/gate.py", "vision/worker.py", "vision/telegram_bot.py", "vision/approval.py", "vision/notify.py", "vision/tg.py",
+                  "vision/hook.py", "vision/store.py", "vision/config.py", "vision/decide.py", "vision/chart.py", "vision/images.py",
+                  "vision/outcome.py", "vision/card_summary.py", "vision/signal_audit.py", "paper/card_quote.py",
+                  "vision_led/situation_map.py")
+VISION_NOTE = ("owner 18 Nov (SRV2 P3): Trade's Vision -> Telegram -> approval path (gate, worker, chart, card, buttons, callbacks, "
+               "expiry) copied from the same commit with the same import rewrite; the bot's own Telegram bot and Anthropic key come "
+               "from the worker's environment (SRV2_* in ATP's .env)")
 MODULES = ("strategy.py", "paper/__init__.py", "paper/engine_entry.py", "paper/bot_hooks.py", "paper/config.py",
            "paper/lots.py", "paper/pause.py", "bots_common/gate_alert.py", "bots_common/error_once.py")
 NOTE = ("owner 18 Nov (SRV2, 15M SRv2 port AS IS): the bot's engine-entry glue copied from the same commit with the same import "
@@ -50,7 +57,8 @@ def main(argv=None):
     if isinstance(later, dict) and "modules" in later:                    # the first block (pre-open charts) kept as is
         later = {"preopen": later}
     for key, mods, note in (("srv2_glue", MODULES, NOTE), ("srv2_engine", ENGINE_MODULES, ENGINE_NOTE),
-                             ("srv2_runner", RUNNER_MODULES, RUNNER_NOTE)):
+                             ("srv2_runner", RUNNER_MODULES, RUNNER_NOTE),
+                             ("srv2_vision", VISION_MODULES, VISION_NOTE)):
         later[key] = {"note": note, "modules": _copy(src, pkg, tops, AIR, mods), "tests": []}
     man["added_later"] = later
     with open(man_p, "w", encoding="utf-8") as f:

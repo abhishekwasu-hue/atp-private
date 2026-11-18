@@ -5,6 +5,8 @@ import datetime
 import json
 import os
 
+import requests
+
 from atp_private.srv2 import host as _H
 
 __srv2_io__ = True
@@ -19,16 +21,39 @@ def _p(*parts):
     return os.path.join(_data(), *parts)
 
 
+def _load_telegram_credentials():
+    """notifications._load_telegram_credentials (Trade L57-74), the environment part: the bot's own Telegram bot (TELEGRAM_BOT_TOKEN /
+    TELEGRAM_CHAT_ID in the worker's environment, set from SRV2_TELEGRAM_* in ATP's .env). Trade's config-file / .env-file fallbacks
+    are not used in ATP. (None, None) when not set."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if token and chat_id:
+        return token, chat_id
+    return None, None
+
+
 def send_telegram_message(message, timeout=10, silent=False, kind=None):
-    """Trade L76-99 with the HTTP post replaced by ATP's `send` adapter; never raises."""
+    """Trade L76-99: through the bot's own Telegram bot when its credentials are set (Trade's code, verbatim); otherwise through
+    ATP to the owner's linked chat (`send` adapter). Never raises."""
     message = _plain(message)
     go, silent = _policy(kind, silent)
     _log_locally(tag(kind, go, silent) + message)
     if not go:
         return True
+    token, chat_id = _load_telegram_credentials()
+    if not token or not chat_id:
+        try:
+            return bool(_H.need("send")(message, silent, kind))
+        except Exception:                                               # noqa: BLE001 - Trade: any failure => False
+            return False
     try:
-        return bool(_H.need("send")(message, silent, kind))
-    except Exception:                                                   # noqa: BLE001 - Trade: any failure => False
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML", **({"disable_notification": True} if silent else {})},
+            timeout=timeout,
+        )
+        return resp.status_code == 200
+    except requests.RequestException:
         return False
 
 
@@ -54,6 +79,73 @@ def _policy(kind, silent):
 def tag(kind, go, silent):
     """The log prefix of one Telegram send (N1 proof: count per type, sound / silent / off) — "{tg:<type>:<sound|silent|off>} "."""
     return "{tg:" + (kind or "other") + ":" + ("off" if not go else "silent" if silent else "sound") + "} "
+
+
+
+def send_telegram_photo(png_bytes, caption, timeout=20, silent=False, kind=None):
+    """Chart image + caption (HTML, Telegram मर्यादा 1024 chars) — Vision V0 साठी. send_telegram_message सारखंच: कधीच raise नाही,
+    credentials नसतील तर फक्त local log. Image नसेल (None) तर फक्त text संदेश."""
+    if not png_bytes:
+        return send_telegram_message(caption, timeout=timeout, silent=silent, kind=kind)
+    caption = _plain(caption)                                           # N11: no internal words
+    go, silent = _policy(kind, silent)
+    _log_locally(tag(kind, go, silent) + "[photo] " + caption)
+    if not go:
+        return True
+    token, chat_id = _load_telegram_credentials()
+    if not token or not chat_id:
+        return False
+    quiet = {"disable_notification": "true"} if silent else {}
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption[:1024], "parse_mode": "HTML", **quiet},
+            files={"photo": ("chart.png", png_bytes, "image/png")},
+            timeout=timeout,
+        )
+        if resp.status_code == 400:                                     # HTML parse चूक ⇒ एकदा साध्या text caption सह
+            import re
+            plain = re.sub(r"<[^>]+>", "", caption).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                data={"chat_id": chat_id, "caption": plain[:1024], **quiet},
+                files={"photo": ("chart.png", png_bytes, "image/png")},
+                timeout=timeout,
+            )
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def send_telegram_media_group(items, timeout=30, silent=False, kind=None):
+    """Abhi (pre-open charts): [(png_bytes, caption)] ⇒ एकच album (sendMediaGroup, 2–10 images; caption साधा मजकूर, ≤ 1024). एकच image ⇒
+    send_telegram_photo. Album अयशस्वी ⇒ एकेक photo (send_telegram_photo). send_telegram_message सारखंच: कधीच raise नाही, token
+    कधीच छापत नाही; credentials नाहीत ⇒ False. रिटर्न bool (सगळे पोहोचले)."""
+    items = [(b, str(c or "")) for b, c in (items or []) if b][:10]
+    if not items:
+        return False
+    if len(items) == 1:
+        return send_telegram_photo(items[0][0], items[0][1], timeout=timeout, silent=silent, kind=kind)
+    go, silent = _policy(kind, silent)
+    _log_locally(tag(kind, go, silent) + f"[album {len(items)}] " + " | ".join(c for _, c in items))
+    if not go:
+        return True
+    token, chat_id = _load_telegram_credentials()
+    if not token or not chat_id:
+        return False
+    media = [{"type": "photo", "media": f"attach://p{i}", "caption": c[:1024]} for i, (_, c) in enumerate(items)]
+    files = {f"p{i}": (f"chart{i}.png", b, "image/png") for i, (b, _) in enumerate(items)}
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/sendMediaGroup",
+                             data={"chat_id": chat_id, "media": json.dumps(media), **({"disable_notification": "true"} if silent else {})},
+                             files=files, timeout=timeout)
+        if resp.status_code == 200:
+            return True
+    except requests.ConnectionError:                                    # पोहोचलंच नाही ⇒ एकेक photo
+        pass
+    except requests.RequestException:                                   # उदा. ReadTimeout: album कदाचित पोहोचला ⇒ पुन्हा नाही (duplicate नको)
+        return False
+    return all([send_telegram_photo(b, c, timeout=timeout, silent=silent or i > 0, kind=kind) for i, (b, c) in enumerate(items)])
 
 
 
