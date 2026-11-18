@@ -31,8 +31,8 @@ def env(tmp_path, monkeypatch):
     host.install()
     state = NS(stored={}, opened=[], sent=[], open_now=False, symbols=None, live_ok=False)
     host.register(
-        settings=lambda strategy, symbol: state.stored.get(symbol),
-        signal_symbols=lambda: state.symbols,
+        settings=lambda strategy, symbol: ({"signal_symbols": state.symbols} if strategy == "__signal_symbols__" and state.symbols
+                                           else state.stored.get(symbol) if strategy == S.STRATEGY_KEY else None),
         token=lambda: "tok",
         option_chain=lambda tok, sym, idx: (chain(), ""),
         option_expiries=lambda tok, sym: ["2026-11-18", "2026-11-25"],

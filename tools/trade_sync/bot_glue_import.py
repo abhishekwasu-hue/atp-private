@@ -22,6 +22,9 @@ ENGINE_MODULES = ("trading_engine.py", "database.py", "trade_monitor.py", "order
 ENGINE_NOTE = ("owner 18 Nov (SRV2, OPEN_QUESTIONS SRV2-Q1 default A): Trade's PAPER engine for the bot's positions - open, exits "
                "(manage_open_trades) and the monitor loop - copied from the same commit with the same import rewrite; ATP's adapters for "
                "cloud_db / upstox_api / notifications / broker_factory are installed by atp_private.srv2.host")
+RUNNER_MODULES = ("scripts/engine_signal_run.py", "scripts/engine_resident.py")
+RUNNER_NOTE = ("owner 18 Nov (SRV2): the engine's run path (engine_signal_run.main per symbol, engine_resident's close / due / window "
+               "functions) copied AS IS; atp_private.srv2.runner calls them in-process at each 5M close instead of Trade's cron")
 MODULES = ("strategy.py", "paper/__init__.py", "paper/engine_entry.py", "paper/bot_hooks.py", "paper/config.py",
            "paper/lots.py", "paper/pause.py", "bots_common/gate_alert.py", "bots_common/error_once.py")
 NOTE = ("owner 18 Nov (SRV2, 15M SRv2 port AS IS): the bot's engine-entry glue copied from the same commit with the same import "
@@ -46,7 +49,8 @@ def main(argv=None):
     later = man.get("added_later") or {}
     if isinstance(later, dict) and "modules" in later:                    # the first block (pre-open charts) kept as is
         later = {"preopen": later}
-    for key, mods, note in (("srv2_glue", MODULES, NOTE), ("srv2_engine", ENGINE_MODULES, ENGINE_NOTE)):
+    for key, mods, note in (("srv2_glue", MODULES, NOTE), ("srv2_engine", ENGINE_MODULES, ENGINE_NOTE),
+                             ("srv2_runner", RUNNER_MODULES, RUNNER_NOTE)):
         later[key] = {"note": note, "modules": _copy(src, pkg, tops, AIR, mods), "tests": []}
     man["added_later"] = later
     with open(man_p, "w", encoding="utf-8") as f:

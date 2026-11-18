@@ -352,6 +352,14 @@
     "paper/journal.py"
    ],
    "tests": []
+  },
+  "srv2_runner": {
+   "note": "owner 18 Nov (SRV2): the engine's run path (engine_signal_run.main per symbol, engine_resident's close / due / window functions) copied AS IS; atp_private.srv2.runner calls them in-process at each 5M close instead of Trade's cron",
+   "modules": [
+    "scripts/engine_signal_run.py",
+    "scripts/engine_resident.py"
+   ],
+   "tests": []
   }
  }
 }

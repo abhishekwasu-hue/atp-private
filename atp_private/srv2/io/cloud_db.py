@@ -53,11 +53,11 @@ def get_strategy_settings(strategy_name, symbol):
 
 
 def get_signal_symbols():
-    """cloud_db.get_signal_symbols (L1340-1346): the stored list (`signal_symbols` adapter) cleaned; none / bad => the default."""
+    """cloud_db.get_signal_symbols (L1340-1346), verbatim: the `__signal_symbols__` / ALL row; none / unreadable / bad => the default."""
     try:
-        raw = _H.get("signal_symbols", lambda: None)()
+        raw = get_strategy_settings(SIGNAL_SYMBOLS_STRATEGY_KEY, SIGNAL_SYMBOLS_SYMBOL_KEY).get("signal_symbols")
         return clean_signal_symbols(raw) if raw else list(SIGNAL_SYMBOLS_DEFAULT)
-    except Exception:                                                   # noqa: BLE001
+    except Exception:                                                     # noqa: BLE001
         return list(SIGNAL_SYMBOLS_DEFAULT)
 
 
@@ -257,6 +257,15 @@ def get_next_level_in_direction(symbol, entry_level_price, direction_bullish, ti
     return
 
 
+def get_strategy_settings_raw(strategy_name, symbol):
+    """cloud_db.get_strategy_settings_raw (L1610-1624): the stored row without defaults ({} when none); the store unreachable raises."""
+    return dict(_H.need("settings")(strategy_name, symbol) or {})
+
+
+SIGNAL_SYMBOLS_STRATEGY_KEY = "__signal_symbols__"                        # cloud_db L1322-1323
+SIGNAL_SYMBOLS_SYMBOL_KEY = "ALL"
+
+
 def get_all_broker_accounts(active_only=True):
     """cloud_db.get_all_broker_accounts (L890-908): other brokers' accounts for multi-account LIVE - not ported (LIVE is not wired);
     None = Trade's result when its database is unreachable."""
@@ -264,8 +273,11 @@ def get_all_broker_accounts(active_only=True):
 
 
 def _not_ported(name):
+    """Trade's OI snapshot / signal-log / market-zone tables are not ported (OPEN_QUESTIONS SRV2-Q3): a read returns None and a write
+    does nothing - Trade's own result when its database is unreachable - so an exit check that reads them (the OI-reversal exit, when
+    switched on in engine_settings.json) never stops the other exit rules."""
     def fn(*args, **kwargs):
-        raise _H.HostNotReady(f"cloud_db.{name}: OI snapshots of Trade's other bots are not part of this port")
+        return None
     fn.__name__ = name
     return fn
 

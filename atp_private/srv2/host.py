@@ -19,7 +19,6 @@ import sys
 PREFIX = "atp_private.trade_engine"
 NAMES = (
     "settings",          # (strategy_key, symbol) -> the stored settings row (dict) or None
-    "signal_symbols",    # () -> the stored signal-symbol list or None
     "token",             # () -> the owner's Upstox access token or None
     "option_chain",      # (token, symbol, expiry_index) -> (Upstox /option/chain rows, reason)
     "option_expiries",   # (token, symbol) -> ["YYYY-MM-DD", ...] nearest first
