@@ -29,8 +29,8 @@ def main(argv=None):
     src, dest = os.path.abspath(a.src), os.path.abspath(a.dest)
     sys.path.insert(0, src)                                               # the rewrite tools import `scripts.engine_closure` (Trade layout)
     sys.path.insert(0, os.path.join(src, "scripts"))
-    import atp_import_rewrite as AIR                                      # noqa: E402  (Trade's own copy at the snapshot commit)
-    from scripts import engine_closure as EC                              # noqa: E402
+    import atp_import_rewrite as AIR
+    from scripts import engine_closure as EC
     pkg = os.path.join(dest, "atp_private", "trade_engine")
     man_p = os.path.join(pkg, "IMPORT_MANIFEST.json")
     with open(man_p, encoding="utf-8") as f:

@@ -46,10 +46,15 @@ def env(tmp_path, monkeypatch):
     host.uninstall()
 
 
+def _read(p):
+    with open(p, encoding="utf-8") as f:
+        return f.read()
+
+
 def chain(spot=24010.0):
     rows = []
     for k in range(23500, 24551, 50):
-        def leg(kind):
+        def leg(kind, k=k):
             itm = (spot - k) if kind == "CE" else (k - spot)
             ltp = max(itm, 0) + 40.0 + abs(k - spot) * 0.02
             return {"instrument_key": f"NSE_FO|{kind}{k}", "market_data": {"ltp": round(ltp, 2)}, "option_greeks": {"pop": 0.5}}
@@ -73,8 +78,8 @@ def gate(action="ENTER", lots=99, naked=99):
     calls = []
 
     def fn(bot, symbol, mode, direction, level, role, tf, bar, spot, lots_, naked_, tags=None, path=None):
-        calls.append(dict(bot=bot, symbol=symbol, mode=mode, direction=direction, level=level, role=role, tf=tf, lots=lots_,
-                          naked=naked_))
+        calls.append({"bot": bot, "symbol": symbol, "mode": mode, "direction": direction, "level": level, "role": role, "tf": tf,
+                      "lots": lots_, "naked": naked_})
         return NS(action=action, lots=lots, naked_lots=naked, note=action.lower(), signal_id="sig1", final=True)
     fn.calls = calls
     return fn
@@ -117,7 +122,10 @@ def test_an_approved_entry_opens_the_spread_and_the_naked_leg_from_the_dashboard
     assert spread["lots"] == 2 and naked["lots"] == 1 and spread["trading_mode"] == "PAPER" and spread["lot_size"] == 65
     assert spread["entry_reason_tag"] == "ENGINE_E2" and spread["entry_timeframe"] == "ENGINE" and spread["source"] == SRC
     assert spread["target_pct_of_max_profit"] == float(S.DEFAULTS["spread_target_pct_of_premium"])
-    from atp_private.trade_engine.strategy import select_credit_spread_itm, select_naked_option_itm
+    from atp_private.trade_engine.strategy import (
+        select_credit_spread_itm,
+        select_naked_option_itm,
+    )
     st = S.merged("NIFTY", {"lots": 2, "naked_lots": 1})
     atm = round(24010.0 / 50) * 50
     assert spread["legs"] == select_credit_spread_itm(chain(), "BULLISH", atm, step=50, itm_depth_points=st["itm_depth_points"],
@@ -172,7 +180,7 @@ def test_a_turned_down_card_opens_nothing_and_a_waiting_card_waits(env):
     assert "turned down" in run(env, gate("REJECT")) and not env.opened
     store_row([entry("E2", visit="b")])
     held = gate("HOLD")
-    held_fn = lambda *a, **k: NS(**{**vars(held(*a, **k)), "final": False})   # noqa: E731
+    held_fn = lambda *a, **k: NS(**{**vars(held(*a, **k)), "final": False})
     assert "waiting for Vision" in run(env, held_fn) and not env.opened
 
 
@@ -206,11 +214,11 @@ def test_the_copied_glue_is_trades_code_with_only_the_imports_rewritten():
     sys.path[:0] = [src, os.path.join(src, "scripts")]
     import atp_import_rewrite as AIR
     from scripts import engine_closure as EC
-    man = json.load(open(os.path.join(ENGINE, "IMPORT_MANIFEST.json"), encoding="utf-8"))
+    man = json.loads(_read(os.path.join(ENGINE, "IMPORT_MANIFEST.json")))
     tops = EC.top_modules(src)
     for rel in man["added_later"]["srv2_glue"]["modules"]:
-        want = AIR.rewrite(open(os.path.join(src, rel), encoding="utf-8").read(), tops, src)
-        assert open(os.path.join(ENGINE, rel), encoding="utf-8").read() == want, rel
+        want = AIR.rewrite(_read(os.path.join(src, rel)), tops, src)
+        assert _read(os.path.join(ENGINE, rel)) == want, rel
 
 
 def test_the_defaults_are_trades_own():
@@ -219,7 +227,7 @@ def test_the_defaults_are_trades_own():
     if not src:
         pytest.skip("TRADE_SRC (a Trade checkout at the snapshot commit) not set")
     import ast
-    tree = ast.parse(open(os.path.join(src, "cloud_db.py"), encoding="utf-8").read())
+    tree = ast.parse(_read(os.path.join(src, "cloud_db.py")))
     for n in tree.body:
         if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", None) == "STRATEGY_SETTINGS_DEFAULTS":
             d = dict(zip([ast.literal_eval(k) for k in n.value.keys], n.value.values))
