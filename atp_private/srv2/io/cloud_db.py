@@ -254,13 +254,13 @@ def get_next_level_in_direction(symbol, entry_level_price, direction_bullish, ti
     """cloud_db.get_next_level_in_direction (L1647-1680) reads Trade's `market_zones` table (the legacy level bots' zones), which is not
     ported. For the engine's positions (entry_timeframe "ENGINE") Trade asks for zone types *_ENGINE, of which no writer exists, so Trade
     finds no level either: None here is Trade's own result (owner 18 Nov: kept AS IS, noted)."""
-    return None
+    return
 
 
 def get_all_broker_accounts(active_only=True):
     """cloud_db.get_all_broker_accounts (L890-908): other brokers' accounts for multi-account LIVE - not ported (LIVE is not wired);
     None = Trade's result when its database is unreachable."""
-    return None
+    return
 
 
 def _not_ported(name):

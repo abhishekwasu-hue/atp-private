@@ -5,7 +5,6 @@ the copied Trade code. Synthetic prices; the clock of the exit check is fixed (1
 """
 import datetime as _dt
 import json
-import os
 import sqlite3
 from types import SimpleNamespace as NS
 
@@ -42,7 +41,7 @@ def prices_of(rows):
 
 
 class _FrozenDT(_dt.datetime):
-    at = _dt.datetime(2026, 11, 12, 5, 0)                                  # 10:30 IST in UTC
+    at = _dt.datetime(2026, 11, 12, 5, 0)                                  # 10:30 IST in UTC  # noqa: DTZ001 - naive UTC, as Trade reads utcnow()
 
     @classmethod
     def utcnow(cls):
@@ -50,7 +49,7 @@ class _FrozenDT(_dt.datetime):
 
     @classmethod
     def now(cls, tz=None):
-        return cls.at + _dt.timedelta(hours=5, minutes=30) if tz is None else cls.at.replace(tzinfo=_dt.timezone.utc).astimezone(tz)
+        return cls.at + _dt.timedelta(hours=5, minutes=30) if tz is None else cls.at.replace(tzinfo=_dt.UTC).astimezone(tz)
 
 
 @pytest.fixture()

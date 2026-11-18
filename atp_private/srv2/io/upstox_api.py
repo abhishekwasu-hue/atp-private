@@ -86,17 +86,17 @@ def get_total_capital(access_token):
 
 def fetch_required_margin(access_token, orders):
     """Trade L783 asks Upstox's margin calculator; not wired => None (Trade's result on failure: PAPER stores no margin)."""
-    return None
+    return
 
 
 def fetch_broker_positions(access_token):
     """Trade L1006: the broker's own positions (LIVE reconciliation). Not wired => None (Trade's result on failure)."""
-    return None
+    return
 
 
 def upload_to_google_drive(file_bytes, filename, mime_type="text/csv"):
     """Trade L513 (Drive backup of Trade's database): not part of ATP - nothing uploaded."""
-    return None
+    return
 
 
 def broker_order_quantity(order):
