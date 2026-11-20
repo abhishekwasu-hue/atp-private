@@ -326,6 +326,40 @@
     "bots_common/error_once.py"
    ],
    "tests": []
+  },
+  "srv2_engine": {
+   "note": "owner 18 Nov (SRV2, OPEN_QUESTIONS SRV2-Q1 default A): Trade's PAPER engine for the bot's positions - open, exits (manage_open_trades) and the monitor loop - copied from the same commit with the same import rewrite; ATP's adapters for cloud_db / upstox_api / notifications / broker_factory are installed by atp_private.srv2.host",
+   "modules": [
+    "trading_engine.py",
+    "database.py",
+    "trade_monitor.py",
+    "order_safety.py",
+    "entry_inflight.py",
+    "carry_guard.py",
+    "exit_price_fallback.py",
+    "monitor_timing.py",
+    "charges.py",
+    "log_setup.py",
+    "process_lock.py",
+    "order_execution.py",
+    "engine_service.py",
+    "oi_analysis.py",
+    "paper/watch.py",
+    "mcx_contract_specs.py",
+    "mcx_quantity_check.py",
+    "notify_policy.py",
+    "read_cache.py",
+    "paper/journal.py"
+   ],
+   "tests": []
+  },
+  "srv2_runner": {
+   "note": "owner 18 Nov (SRV2): the engine's run path (engine_signal_run.main per symbol, engine_resident's close / due / window functions) copied AS IS; atp_private.srv2.runner calls them in-process at each 5M close instead of Trade's cron",
+   "modules": [
+    "scripts/engine_signal_run.py",
+    "scripts/engine_resident.py"
+   ],
+   "tests": []
   }
  }
 }

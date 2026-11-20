@@ -1,0 +1,146 @@
+"""
+engine_service.py
+------------------------------------
+🎓 वापरकर्त्याशी चर्चा करून जोडलेली सुधारणा (Phase 1 — Position Monitoring Decoupling) — established
+`manage_open_trades()` (SL/Target/EOD/OI-reversal exits) आधी फक्त Streamlit Dashboard page उघडं
+असताना, आणि established `st_autorefresh` साठी browser tab उघडं असतानाच चालायचं. ब्राउझर बंद केला की
+थांबायचं — म्हणजे उघडे live positions रात्रभर SL/Target/EOD शिवाय राहण्याचा गंभीर धोका होता.
+
+ही script आता तेच काम — पण Dashboard पासून पूर्णपणे स्वतंत्र — established codebase-convention प्रमाणे
+"single-shot" स्वरूपात करते (srv2_momentum_reversal_strategy.py, oi_snapshot_collector.py सारखीच —
+एकदा चालून थांबते, systemd timer/cron दर १ मिनिटाला पुन्हा चालवतो). हे established, कायम-चालणाऱ्या
+"while True" daemon पेक्षा 1GB RAM droplet साठी सुरक्षित आहे (memory leak साचण्याचा प्रश्नच येत नाही —
+प्रत्येक वेळी ताजी प्रोसेस, थोडक्यात आयुष्य).
+
+Settings established Streamlit sidebar वरून established data/engine_settings.json मध्ये (dashboard
+लिहितं) येतात — नसेल/वाचता आला नाही तर सुरक्षित डीफॉल्ट्स वापरले जातात (शांतपणे, क्रॅश न होता).
+Token established cloud_db (Supabase, upstox_tokens table) मार्फत — तोच जो dashboard आणि इतर सर्व
+cron scripts वापरतात.
+
+चालवणे (systemd timer/cron मधून, दर १ मिनिटाला, बाजार तासांत):
+    python3 engine_service.py
+"""
+import json
+import os
+
+import atp_private.trade_engine.cloud_db as cloud_db
+from atp_private.trade_engine.config import is_market_open
+from atp_private.trade_engine.notifications import notify_error, notify_exit, write_heartbeat
+from atp_private.trade_engine.process_lock import ProcessLock, ProcessLockHeld
+from atp_private.trade_engine.trading_engine import manage_open_trades
+from atp_private.trade_engine.upstox_api import fetch_candles
+
+from atp_private.trade_engine.log_setup import get_logger
+
+_logger = get_logger("engine_service.py")
+
+SCRIPT_NAME = "engine_service"
+SETTINGS_PATH = os.path.join("data", "engine_settings.json")
+MONITORED_SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"]
+
+DEFAULT_SETTINGS = {
+    "trading_mode": "PAPER",
+    "monitoring_enabled": False,
+    "product_type": "D",
+    "oi_reversal_exit_enabled": True,
+    "trailing_sl_enabled": False,
+    "atr_multiplier": 1.5,
+    "eod_squareoff_hour": 15,
+    "eod_squareoff_minute": 15,
+    # 🎓 G3: order सुरक्षा (order_safety.py) — डीफॉल्ट जुनं वर्तन: market_protection पाठवत नाही, इशारा ON, retry OFF
+    "order_market_protection_pct": None,
+    "exit_fail_alert": True,
+    "exit_retry_on_fail": False,
+}
+
+
+def load_settings():
+    """data/engine_settings.json वाचणे — नसेल/करप्ट असेल तर सुरक्षित डीफॉल्ट्स (monitoring_enabled=False,
+    म्हणजे काहीतरी चुकलं तरी आपोआप कुठलाही exit-order जाणार नाही — fail-safe)."""
+    try:
+        with open(SETTINGS_PATH) as f:
+            settings = json.load(f)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(settings)
+        return merged
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_SETTINGS)
+
+
+def compute_atr_points(access_token, symbol, settings):
+    """trailing_sl_enabled असेल तरच 15-मिनिट candles वरून ATR काढणे — नाहीतर None (मूळ स्थिर SL वापरला जाईल)."""
+    if not settings.get("trailing_sl_enabled"):
+        return None
+    try:
+        from atp_private.trade_engine.signals import compute_atr
+    except ImportError:
+        return None
+    try:
+        df = fetch_candles(access_token, symbol, underlying_price=0, interval="15minute", lookback_days=5)
+        return compute_atr(df, period=14) if not df.empty else None
+    except Exception:
+        _logger.exception("compute_atr_points() मध्ये अनपेक्षित चूक (silently handled)")
+        return None  # ATR मिळालं नाही तर ट्रेलिंग बंद राहील, मूळ स्थिर SL तसाच लागू होईल — क्रॅश नाही
+
+
+def run_once():
+    if not is_market_open():
+        return  # बाजार बंद असताना उगाच काहीही तपासायचं नाही
+
+    settings = load_settings()
+    if not settings.get("monitoring_enabled"):
+        return  # Dashboard वरून Live Trading सक्रिय/पुष्टी केलेली नाही — काहीही करायचं नाही
+
+    token = cloud_db.get_effective_upstox_token(None)
+    if not token:
+        notify_error(SCRIPT_NAME, "Upstox token not found (Supabase empty) — position monitoring skipped this cycle.")
+        return
+
+    # 🎓 वापरकर्त्याने पडताळणीत सापडवलेली, गंभीर bug (live trading आधी) — trade_monitor.py चा
+    # docstring म्हणतो की duplicate-exit bug (हीच script + trade_monitor.py दोघेही एकाच वेळी
+    # manage_open_trades() चालवत) आधीच "consolidation" ने सुटलेली आहे, पण deploy/README.md आणि
+    # deploy/engine_service.timer/.service अजूनही फक्त याच script साठीच आहेत (trade_monitor.py
+    # साठी कुठलाही systemd unit कधीच जोडलेला नाही) — म्हणजे नेमकं कोणती script प्रत्यक्ष VPS वर
+    # चालू आहे (किंवा चुकून दोन्ही) हे repo वरून खात्रीने सांगता येत नाही. त्यामुळे इथे + trade_monitor.py
+    # दोन्हीकडे एकाच नावाचा ProcessLock — कुठलीही, किंवा दोन्ही, समांतर चालल्या तरी एकाच वेळी फक्त
+    # एकच प्रत्यक्षात manage_open_trades() चालवेल, दुसरी सुरक्षितपणे वगळली जाईल.
+    try:
+        with ProcessLock("position_exit_monitor"):
+            for symbol in MONITORED_SYMBOLS:
+                try:
+                    atr_points = compute_atr_points(token, symbol, settings)
+                    closed_now = manage_open_trades(
+                        token, symbol, settings["product_type"],
+                        eod_squareoff_hour=settings["eod_squareoff_hour"],
+                        eod_squareoff_minute=settings["eod_squareoff_minute"],
+                        oi_reversal_exit_enabled=settings["oi_reversal_exit_enabled"],
+                        trailing_sl_enabled=settings["trailing_sl_enabled"],
+                        atr_points=atr_points, atr_multiplier=settings["atr_multiplier"],
+                    )
+                    for c in closed_now:
+                        if c.get("mode") != "PAPER":                     # N6: PAPER exits = paper/watch (one message)
+                            notify_exit(SCRIPT_NAME, symbol, c["trade_id"], c["reason"], pnl=c.get("pnl"))
+                except Exception as exc:
+                    # एका symbol मध्ये अपयश आलं तरी बाकीच्या symbols चं monitoring थांबता कामा नये.
+                    notify_error(SCRIPT_NAME, f"{symbol} monitoring failed: {exc}")
+            write_heartbeat(SCRIPT_NAME)
+    except ProcessLockHeld:
+        return  # दुसरी exit-monitor invocation (हीच script किंवा trade_monitor.py) अजून चालू आहे — डुप्लिकेट-एक्झिट टाळण्यासाठी वगळलं
+    try:                                                               # 🎓 Abhi (Monday PAPER): updates + journal, exit lock सुटल्यानंतर, best-effort
+        from atp_private.trade_engine.paper import watch as _paper_watch
+        _paper_watch.run_locked(token)
+    except Exception as exc:
+        print(f"⚠️ paper watch (exits वर परिणाम नाही): {exc}")
+
+
+def main():
+    """M56 S8 (audit B15): this service is disabled and unused (deploy/README.md: trade_monitor.py on cron is the one exit monitor;
+    never enable engine_service.timer — it would duplicate it) and its run_once returns before any exit when monitoring_enabled is
+    off / no token. So running it as a script is refused; trade_monitor.py imports only its shared helpers."""
+    print("❌ engine_service.py refuses to run: it is disabled and unused — exits are handled by trade_monitor.py (cron), see "
+          "deploy/README.md. Its old run_once skipped every exit while monitoring_enabled was off or the token missing.")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
