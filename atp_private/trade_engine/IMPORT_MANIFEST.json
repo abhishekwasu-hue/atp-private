@@ -301,14 +301,31 @@
   "vision_led/charts.py"
  ],
  "added_later": {
-  "note": "owner 4 Nov (pre-open charts from ATP's job): copied from the same commit with the same import rewrite; preopen_chart.py carries three marked ATP display additions (phase in the title, the unfilled opening-gap band, the close word); test_preopen_charts.py without the four Trade-bot plumbing tests",
-  "modules": [
-   "bots_common/preopen_crux.py",
-   "decision3/preopen_chart.py",
-   "scripts/level_gate_preopen.py"
-  ],
-  "tests": [
-   "tests/test_preopen_charts.py"
-  ]
+  "preopen": {
+   "note": "owner 4 Nov (pre-open charts from ATP's job): copied from the same commit with the same import rewrite; preopen_chart.py carries three marked ATP display additions (phase in the title, the unfilled opening-gap band, the close word); test_preopen_charts.py without the four Trade-bot plumbing tests",
+   "modules": [
+    "bots_common/preopen_crux.py",
+    "decision3/preopen_chart.py",
+    "scripts/level_gate_preopen.py"
+   ],
+   "tests": [
+    "tests/test_preopen_charts.py"
+   ]
+  },
+  "srv2_glue": {
+   "note": "owner 18 Nov (SRV2, 15M SRv2 port AS IS): the bot's engine-entry glue copied from the same commit with the same import rewrite (tools/trade_sync/bot_glue_import.py); ATP's adapters for the Trade IO modules it calls are installed by atp_private.srv2.host",
+   "modules": [
+    "strategy.py",
+    "paper/__init__.py",
+    "paper/engine_entry.py",
+    "paper/bot_hooks.py",
+    "paper/config.py",
+    "paper/lots.py",
+    "paper/pause.py",
+    "bots_common/gate_alert.py",
+    "bots_common/error_once.py"
+   ],
+   "tests": []
+  }
  }
 }
