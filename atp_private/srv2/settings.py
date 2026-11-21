@@ -163,3 +163,7 @@ def clean_signal_symbols(value):
     if not out:
         raise ValueError("signal_symbols: at least one symbol")
     return out
+
+
+# SRV2 P2: the owner's settings page for ATP (field list, page values, validation) - see page_fields.py.
+from .page_fields import FIELDS, validate, values_for_page  # noqa: F401

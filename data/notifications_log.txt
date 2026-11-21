@@ -33,3 +33,8 @@
 • Safe side: no entry was taken from it; exits are not affected.
 • An engine entry was waiting at that moment and was NOT taken because of this error.
 • One alert per cause per day; the cause is being fixed.
+[2026-11-21 15:59:03] {tg:error:sound} ⚠️ Alert — error in the engine entry step (NIFTY, first at 15:59). No action — information.
+• What failed: HostNotReady: ATP adapter 'option_chain' is not registered
+• Safe side: no entry was taken from it; exits are not affected.
+• An engine entry was waiting at that moment and was NOT taken because of this error.
+• One alert per cause per day; the cause is being fixed.
