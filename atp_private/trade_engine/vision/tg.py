@@ -1,0 +1,223 @@
+"""vision/tg.py — Telegram (V1): बटणांसह chart, caption edit, callback उत्तर, getUpdates. Token `notifications` च्याच credentials मधून;
+कधीच print / log नाही. सगळी functions कधीच raise करत नाहीत (network चूक ⇒ None / False).
+"""
+import json
+import re
+
+import requests
+
+API = "https://api.telegram.org/bot{token}/{method}"
+CAPTION_LIMIT = 1024                                                    # photo caption (Telegram, UTF-16 units)
+TEXT_LIMIT = 4096                                                       # text message (chart नसताना पाठवलेला card / ticket)
+
+
+def _creds():
+    from atp_private.trade_engine.notifications import _load_telegram_credentials
+    return _load_telegram_credentials()
+
+
+def _call(method, data=None, files=None, timeout=20, token=None):
+    tok = token or _creds()[0]
+    if not tok:
+        return None
+    try:
+        r = requests.post(API.format(token=tok, method=method), data=data, files=files, timeout=timeout)
+        j = r.json()
+        return j if j.get("ok") else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def can_ask():
+    """(ok, कारण). बटणं तेव्हाच: secret + approvers आहेत **आणि** बटणं जिथे जातात तो chat (notifications चा TELEGRAM_CHAT_ID) approvers मध्ये आहे
+    — नाहीतर प्रत्येक दाब "परवानगी नाही" होऊन signal शांतपणे timeout नियमाने जाईल."""
+    from . import decide as VD
+    if not VD.secret() or not VD.approver_ids():
+        return False, "VISION_CALLBACK_SECRET / TELEGRAM_APPROVER_IDS missing"
+    cid = _creds()[1]
+    if not cid or str(cid).strip() not in VD.approver_ids():
+        return False, "Telegram chat id not in TELEGRAM_APPROVER_IDS (group chat? add its id too)"
+    return True, ""
+
+
+def keyboard(buttons):
+    """buttons = [(text, callback_data), …] ⇒ ≤ 3 असतील तर एका ओळीत, जास्त ⇒ दोन-दोनच्या ओळी (✅ ❌ / ✏️ 📝)."""
+    b = [{"text": t, "callback_data": d} for t, d in buttons]
+    rows = [b] if len(b) <= 3 else [b[i:i + 2] for i in range(0, len(b), 2)]
+    return json.dumps({"inline_keyboard": rows})
+
+
+def _policy(kind, silent):
+    """N1 (30 Oct, DECISIONS 142): notify_policy per message type — (send?, extra data for a silent send). Never blocks on failure."""
+    try:
+        import atp_private.trade_engine.notify_policy as notify_policy
+        go, quiet = notify_policy.resolve(kind, silent)
+    except Exception:                                                    # noqa: BLE001
+        go, quiet = True, bool(silent)
+    try:                                                                 # the same per-send log line as notifications (N1 proof)
+        import atp_private.trade_engine.notifications as NT
+        NT._log_locally(NT.tag(kind, go, quiet) + "[vision]")
+    except Exception:                                                    # noqa: BLE001
+        pass
+    return go, ({"disable_notification": "true"} if quiet else {})
+
+
+def _plain(text):
+    """N11: bots_common.plain_text.dejargon (display only); any failure ⇒ the text as is."""
+    try:
+        from atp_private.trade_engine.bots_common import plain_text as PT
+        return PT.dejargon(text)
+    except Exception:                                                    # noqa: BLE001
+        return text
+
+
+def send_photo(png, caption, buttons=None, chat_id=None, silent=False, kind="approval_card"):
+    """रिटर्न message_id किंवा None. HTML caption चूक ⇒ साध्या text ने एकदा. `kind` (N1): the decision card by default (sound); a
+    policy "off" ⇒ not sent (None)."""
+    cid = chat_id or _creds()[1]
+    if not cid:
+        return None
+    go, quiet = _policy(kind, silent)
+    if not go:
+        return None
+    caption = _plain(caption)                                            # N11: no internal words
+    data = {"chat_id": cid, "caption": caption[:1024], "parse_mode": "HTML", **quiet}
+    if buttons:
+        data["reply_markup"] = keyboard(buttons)
+    files = {"photo": ("chart.png", png, "image/png")} if png else None
+    method = "sendPhoto" if png else "sendMessage"
+    if not png:
+        data["text"] = data.pop("caption")
+    j = _call(method, data, files)
+    if j is None:
+        import re
+        plain = re.sub(r"<[^>]+>", "", caption)[:1024]
+        data.pop("parse_mode", None)
+        data["caption" if png else "text"] = plain
+        j = _call(method, data, files)
+    return (j or {}).get("result", {}).get("message_id")
+
+
+def edit_caption(message_id, caption, chat_id=None, has_photo=True, buttons=None):
+    """बटणं काढून caption बदल (निर्णय नोंद). buttons (N17: Vision's verdict on a still-open card) ⇒ the keyboard is kept."""
+    cid = chat_id or _creds()[1]
+    if not cid or not message_id:
+        return False
+    data = {"chat_id": cid, "message_id": message_id, "parse_mode": "HTML",
+            "reply_markup": keyboard(buttons) if buttons else json.dumps({"inline_keyboard": []})}
+    if has_photo:
+        data["caption"] = caption[:1024]
+        return _call("editMessageCaption", data) is not None
+    data["text"] = caption[:4096]
+    return _call("editMessageText", data) is not None
+
+
+def edit_any(message_id, caption, chat_id=None):
+    """Photo caption किंवा (chart नसताना पाठवलेला) text — दोन्ही प्रयत्न. ⚠️ हा पूर्ण caption **बदलतो** — Vision outcome साठी कधीच नाही
+    (T-1: `append_outcome` वापरा)."""
+    return edit_caption(message_id, caption, chat_id, True) or edit_caption(message_id, caption, chat_id, False)
+
+
+def _cut_html_safe(s, units):
+    """Tags काढलेला मजकूर ≤ units (UTF-16) — शेवटचा अर्धवट entity (&am…) काढतो ⇒ HTML parse चूक नाही."""
+    from atp_private.trade_engine.bots_common import plain_text as PT
+    return re.sub(r"&[#\w]*$", "", PT.tg_cut(re.sub(r"<[^>]+>", "", str(s or "")), max(0, units)))
+
+
+def compose_outcome(original, line, limit=CAPTION_LIMIT):
+    """T-1 (Abhi, DECISIONS 29): मूळ caption + "\n" + outcome ओळ(ी) ≤ limit. Outcome ओळ कधीच कापत नाही — जागा लागली तर **जुना** भाग
+    लहान: शेवटून पूर्ण ओळी गाळतो ("…" खूण, पहिली ओळ टिकते; HTML tag अर्धवट नाही); तरीही मोठं ⇒ tags काढून जुना भाग कापतो."""
+    from atp_private.trade_engine.bots_common import plain_text as PT
+    line = str(line or "").strip()
+    limit = limit - PT.MARGIN
+    if PT.tg_len(line) >= limit:                                         # outcome एकटीच मर्यादेपेक्षा मोठी (प्रत्यक्षात होत नाही)
+        return _cut_html_safe(line, limit)
+    old = str(original or "").rstrip()
+    if not old:
+        return line
+    room = limit - PT.tg_len(line) - 1
+    if PT.tg_len(old) <= room:
+        return f"{old}\n{line}"
+    lines = old.split("\n")
+    while len(lines) > 1 and PT.tg_len("\n".join(lines + ["…"])) > room:
+        lines.pop()
+    s = "\n".join(lines + ["…"])
+    if PT.tg_len(s) > room:
+        s = _cut_html_safe(old, room - 1) + "…"
+    return f"{s}\n{line}"
+
+
+def set_buttons(message_id, buttons, chat_id=None):
+    """N2: the card's keyboard only (editMessageReplyMarkup) — e.g. the optional ❌ reason buttons on the same card. Never raises."""
+    try:
+        cid = chat_id or _creds()[1]
+        if not cid or not message_id:
+            return False
+        return _call("editMessageReplyMarkup", {"chat_id": cid, "message_id": message_id, "reply_markup": keyboard(buttons)}) is not None
+    except Exception:                                                    # noqa: BLE001 — display only
+        return False
+
+
+def append_outcome(message_id, original_caption, line, chat_id=None):
+    """T-1: card कधीच पुसत नाही — मूळ caption तसाच ठेवून outcome ओळ जोडतो (`compose_outcome`), आणि बटणं काढतो (हे फक्त निर्णयानंतरच
+    बोलावलं जातं). Photo caption (1024) ⇒ नाही जमलं तर text message (4096) ⇒ HTML चूक असेल तर tags काढून एकदा. कधीच raise नाही."""
+    if not message_id:
+        return False
+    line = _plain(line)                                                  # N11: no internal words
+    original_caption = _plain(original_caption)
+    try:
+        if edit_caption(message_id, compose_outcome(original_caption, line, CAPTION_LIMIT), chat_id, True):
+            return True
+        if edit_caption(message_id, compose_outcome(original_caption, line, TEXT_LIMIT), chat_id, False):
+            return True
+        plain = re.sub(r"<[^>]+>", "", str(original_caption or ""))
+        return bool(edit_caption(message_id, compose_outcome(plain, line, CAPTION_LIMIT), chat_id, True))
+    except Exception:                                                    # noqa: BLE001 — display only
+        return False
+
+
+def reply(message_id, text, chat_id=None, silent=True, kind="other", buttons=None):
+    """T-1: प्रत्येक outcome ला card ला उत्तर म्हणून **नवा** छोटा संदेश (edit ला Telegram notification देत नाही). message_id नाही ⇒ साधा
+    संदेश. रिटर्न नव्या संदेशाचा id किंवा None; कधीच raise नाही."""
+    try:
+        cid = chat_id or _creds()[1]
+        if not cid:
+            return None
+        go, quiet = _policy(kind, silent)                                # N1: a reply under a card is information — silent
+        if not go:
+            return None
+        text = _plain(str(text))                                         # N11: no internal words
+        data = {"chat_id": cid, "text": str(text)[:TEXT_LIMIT], "parse_mode": "HTML", **quiet}
+        if buttons:                                                      # N2: ✏️ / 📝 on the 📎 details message
+            data["reply_markup"] = keyboard(buttons)
+        if message_id:
+            data.update(reply_to_message_id=int(message_id), allow_sending_without_reply="true")
+        j = _call("sendMessage", data)
+        if j is None:                                                    # HTML चूक ⇒ साध्या मजकुराने एकदा
+            data.pop("parse_mode", None)
+            data["text"] = re.sub(r"<[^>]+>", "", str(text))[:TEXT_LIMIT]
+            j = _call("sendMessage", data)
+        return (j or {}).get("result", {}).get("message_id")
+    except Exception:                                                    # noqa: BLE001
+        return None
+
+
+def answer_callback(callback_id, text):
+    return _call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:190]}) is not None
+
+
+def send_text(text, chat_id=None, silent=False, kind="vision_info"):
+    cid = chat_id or _creds()[1]
+    if not cid:
+        return False
+    go, quiet = _policy(kind, silent)
+    if not go:
+        return True
+    text = _plain(text)                                                  # N11: no internal words
+    return _call("sendMessage", {"chat_id": cid, "text": text[:4096], "parse_mode": "HTML", **quiet}) is not None
+
+
+def get_updates(offset, timeout=50):
+    j = _call("getUpdates", {"offset": offset, "timeout": timeout, "allowed_updates": json.dumps(["callback_query", "message"])},
+              timeout=timeout + 15)
+    return (j or {}).get("result") or []

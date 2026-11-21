@@ -360,6 +360,29 @@
     "scripts/engine_resident.py"
    ],
    "tests": []
+  },
+  "srv2_vision": {
+   "note": "owner 18 Nov (SRV2 P3): Trade's Vision -> Telegram -> approval path (gate, worker, chart, card, buttons, callbacks, expiry) copied from the same commit with the same import rewrite; the bot's own Telegram bot and Anthropic key come from the worker's environment (SRV2_* in ATP's .env)",
+   "modules": [
+    "vision/gate.py",
+    "vision/worker.py",
+    "vision/telegram_bot.py",
+    "vision/approval.py",
+    "vision/notify.py",
+    "vision/tg.py",
+    "vision/hook.py",
+    "vision/store.py",
+    "vision/config.py",
+    "vision/decide.py",
+    "vision/chart.py",
+    "vision/images.py",
+    "vision/outcome.py",
+    "vision/card_summary.py",
+    "vision/signal_audit.py",
+    "paper/card_quote.py",
+    "vision_led/situation_map.py"
+   ],
+   "tests": []
   }
  }
 }
