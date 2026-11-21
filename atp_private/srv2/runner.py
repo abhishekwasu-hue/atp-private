@@ -12,6 +12,14 @@ same timing. Every rule is the copied Trade code; this module only decides WHEN,
 The bot's cycle is the engine part of srv2_momentum_reversal_strategy.process_symbol (Trade L235-245: settings, symbol_enabled,
 paper.bot_hooks.pre_cycle -> the engine entry). Its legacy own-level path after that is not ported: with signal_source = engine its
 entries are refused by own_signal_ok anyway, and it reads Trade's market_zones (levels of the legacy level bots), which ATP does not keep.
+
+SRV2 P3: Trade runs Vision and the Telegram ✅ as two systemd services (docs/SRV2_PORT_AUDIT.md section 1):
+- `vision_worker.service`: `python3 -m vision.worker --loop-seconds 3600 --poll 2` (lock, stale rows expired, orphans re-queued, then
+  `run_once` every 2 s: chart, Vision, the card, deadlines / expiry via `v1_housekeeping`);
+- `vision_telegram.service`: `python3 -m vision.telegram_bot` (needs VISION_CALLBACK_SECRET and TELEGRAM_APPROVER_IDS; open cards
+  EXPIRED on start, then `poll_once` long-poll every 0.5 s: ✅ / ❌ callbacks, commands).
+`start_services()` runs the same two loop bodies in two daemon threads of ATP's worker (never inside `tick`, so a slow Vision call or a
+Telegram long-poll never delays the exit monitor - ADR-0004).
 """
 from __future__ import annotations
 
@@ -166,6 +174,96 @@ def engine_close(close, symbols, calendar=None):
         for t in th:
             t.join()
         return todo
+
+
+# --- Vision worker + Telegram ✅ (Trade's two services, P3) ---------------------------------------------------------------------------
+VISION_POLL_S = 2                                                         # vision_worker.service --poll 2
+TELEGRAM_PAUSE_S = 0.5                                                    # telegram_bot.main: time.sleep(0.5) between polls
+_services = {"stop": threading.Event(), "threads": {}}
+
+
+def vision_service(stop, poll=VISION_POLL_S, once=False):
+    """vision.worker.main's loop (Trade L1311-1325) under the same lock, until `stop` is set (Trade: until --loop-seconds)."""
+    _private()
+    from atp_private.trade_engine.process_lock import ProcessLock, ProcessLockHeld
+    from atp_private.trade_engine.vision import store as VS
+    from atp_private.trade_engine.vision import worker as W
+    try:
+        with ProcessLock("vision_worker"):
+            VS.expire_stale(W.STALE_MIN)
+            for sid in VS.requeue_orphans():
+                print(f"♻️ {sid}: RUNNING from a stopped worker ⇒ queued again")
+            while not stop.is_set():
+                try:
+                    for sid, res in W.run_once():
+                        print(f"{VS.now_ist():%H:%M:%S} {sid} → {res.get('verdict')} {res.get('error') or ''}")
+                except Exception as exc:                                # noqa: BLE001 - systemd restarts Trade's worker; here the loop goes on
+                    print(f"srv2 vision worker: {type(exc).__name__}: {exc}")
+                if once:
+                    break
+                stop.wait(poll)
+    except ProcessLockHeld:
+        print("⏭️ vision worker आधीच चालू आहे")
+
+
+def telegram_service(stop, once=False, poll_timeout=50):
+    """vision.telegram_bot.main (Trade L300-324) under the same lock, until `stop` is set. Returns 1 (not started) without the callback
+    secret / approver ids, as Trade: then no card gets buttons and Trade's no-reply rule applies (no entry in human_confirm)."""
+    _private()
+    from atp_private.trade_engine.process_lock import ProcessLock, ProcessLockHeld
+    from atp_private.trade_engine.vision import decide as VD
+    from atp_private.trade_engine.vision import notify as VN
+    from atp_private.trade_engine.vision import store as VS
+    from atp_private.trade_engine.vision import telegram_bot as TB
+    from atp_private.trade_engine.vision import tg as TG
+    if not VD.secret() or not VD.approver_ids():
+        print("❌ VISION_CALLBACK_SECRET आणि TELEGRAM_APPROVER_IDS env हवेत — service सुरू नाही")
+        return 1
+    try:
+        with ProcessLock("vision_telegram"):
+            n = TB.expire_on_restart()
+            print(f"vision telegram service सुरू — restart मुळे {n} pending रद्द")
+            ok, why = TG.can_ask()
+            if not ok:
+                print(f"⚠️ {why}")
+                VN.can_ask_alert(why)
+            offset = int(VS.kv_get("tg_offset") or 0)
+            while not stop.is_set():
+                try:
+                    offset = TB.poll_once(offset, timeout=poll_timeout)
+                except Exception as exc:                                # noqa: BLE001 - systemd restarts Trade's service; here the loop goes on
+                    print(f"srv2 telegram: {type(exc).__name__}: {exc}")
+                    stop.wait(5)
+                if once:
+                    break
+                stop.wait(TELEGRAM_PAUSE_S)
+    except ProcessLockHeld:
+        print("⏭️ vision telegram service आधीच चालू आहे")
+    return 0
+
+
+def start_services(vision=True, telegram=True):
+    """Start the two P3 services in daemon threads (idempotent: a live thread is not started twice). Returns the names started."""
+    stop = _services["stop"]
+    stop.clear()
+    started = []
+    for name, on, fn in (("vision", vision, vision_service), ("telegram", telegram, telegram_service)):
+        th = _services["threads"].get(name)
+        if not on or (th is not None and th.is_alive()):
+            continue
+        th = threading.Thread(target=fn, args=(stop,), name=f"srv2-{name}", daemon=True)
+        _services["threads"][name] = th
+        th.start()
+        started.append(name)
+    return started
+
+
+def stop_services(timeout=5):
+    """Stop the P3 service threads (ATP's worker shutdown / tests)."""
+    _services["stop"].set()
+    for th in list(_services["threads"].values()):
+        th.join(timeout)
+    _services["threads"].clear()
 
 
 # --- ATP's worker calls this ------------------------------------------------------------------------------------------------------------

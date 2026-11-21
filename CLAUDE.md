@@ -3,9 +3,10 @@
 
 # CLAUDE.md - atp-private
 
-- **This repository is PRIVATE.** Method / engine / strategy code (the Trade engine snapshot, the chart reader, the
-  KB and the Method Pack) lives only here. **Never copy any of it to the public ATP repository** (code, text, numbers,
-  fixtures, logs or screenshots of it), and never paste it into a public issue, PR or chat.
+- **This repository is currently PUBLIC by the owner's decision (20-21 Nov, 'Sadhya public rahu de'): anything committed
+  here is world-visible. Still never copy its code into the ATP repository. Secrets are never allowed.** Method / engine /
+  strategy code (the Trade engine snapshot, the chart reader, the KB and the Method Pack) lives only here; never copy any of
+  it (code, text, numbers, fixtures, logs or screenshots of it) into the ATP repository or an ATP issue / PR.
 - ATP (public) only holds the boundary: a provider interface and a loader that imports `atp_private.*` if present.
 - No secrets in this repository: no keys, tokens, `.env` files or server addresses. Deploy keys stay on the hosts.
 - Engine code comes in only as the owner ordered it (Trade order M65: the snapshot, AS IS, import paths only). Never

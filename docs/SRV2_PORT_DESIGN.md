@@ -43,9 +43,36 @@ reads the owner's own method, so it is owner-only (ATP DECISIONS 15 Nov, chart r
 - Tests `tests/test_srv2_engine.py`: entry -> two PAPER positions in Trade's store; the spread closes at PREMIUM_TARGET; a spot fall
   stops it out (SL); nothing moves -> nothing closes; a LIVE order is refused. Exit clock fixed at 10:30 IST.
 
+## P3 (Vision -> Telegram ✅, and the owner's agent modes: AGENT-MODES 20 Nov, ATP ADR-0029)
+
+- Copied AS IS (WIP commit, tool group `srv2_vision`): `vision/{gate,hook,store,config,decide,notify,worker,chart,images,approval,tg,
+  telegram_bot,card_summary,outcome,signal_audit}`, `paper/card_quote`, `vision_led/situation_map`. `srv2/io/notifications` sends through
+  Trade's own Telegram code when the bot's credentials are in the worker's environment (names only: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+  TELEGRAM_APPROVER_IDS, VISION_CALLBACK_SECRET, ANTHROPIC_API_KEY; values only on the host).
+- `srv2/runner.py`: `start_services()` runs Trade's two services in two daemon threads of ATP's worker, never inside `tick` (a Vision
+  call or a Telegram long-poll never delays the exit monitor, ADR-0004): the vision worker (`vision_worker.service`: lock, stale rows
+  expired, orphans re-queued, `run_once` every 2 s) and the Telegram ✅ poll (`vision_telegram.service`: needs the callback secret and the
+  approver ids, open cards EXPIRED on start, `poll_once` every 0.5 s). Card expiry is Trade's own (`gate.resolve_due`,
+  `worker.v1_housekeeping`: deadline = signal + `approve_window_min`; no ✅ = REJECTED = no entry; a late tap is refused).
+- `srv2/modes.py`: the two agent modes as values of Trade's OWN Vision settings (no new rule): `human_confirm` (default for a new
+  deployment) = `vision_mode human_confirm` + `approval_required` (only a `telegram:<id>` ✅ enters); `auto` + Vision on = `auto_veto`,
+  no approval, `vision_fail_action skip`; `auto` + Vision off = `off`, no approval (the bot's own rules). Written through Trade's
+  `VC.save` (its change history) and returned as an audit record for ATP. `auto` is refused unless ATP says it is the owner's own
+  deployment; switching back to `human_confirm` is always allowed; an unreadable / hand-edited row reads as `human_confirm`.
+- PAPER and LIVE: one code path. The engine entry stays PAPER only (Trade); a stored LIVE reads as PAPER until the owner's LIVE switch;
+  the order edge refuses LIVE in both modes. Risk hierarchy / kill switch: Trade's `open_multi_leg_trade` checks, unchanged, both modes.
+- Tests `tests/test_srv2_vision.py` (Trade's real gate, worker decision step and callback handler; only the network edges faked):
+  default human_confirm; a switch audited (who, from -> to, Trade history); auto refused outside the owner's deployment; ✅ -> entry
+  with the dashboard lots; an expired card places nothing (and a late tap is refused); someone else's tap / ❌ / a Vision-only approval
+  place nothing; auto with Vision off / on (disagree and unavailable skip, agree enters); parity: auto places exactly the positions
+  human_confirm places after ✅ for the same bars; LIVE refused unless the owner's switch, and the order edge refuses LIVE.
+- Open: SRV2-Q5 (`auto` + Vision unavailable: default skip), SRV2-Q6 (`auto` + Vision gray: Trade's default `half` = advice only, enters
+  at full lots), SRV2-Q7 (plotly + kaleido must be in ATP's backend image for the card's chart photo, as this design already says; the
+  card without them is not tested here). Logged in ATP docs/OPEN_QUESTIONS.md by the ATP session.
+
 ## Next
 
 P1b ATP: the owner-only "SRv2 bot" deployment, the adapters (Upstox chain / expiries through the broker budget, the owner's open
 positions, the PAPER open, Telegram send), the runner (engine per 5M close, bot cycle every minute in the market hours, as Trade's
-cron). P2 settings page. P3 Vision / Telegram. P4 exits. P5 parity + screenshots. Matplotlib / plotly / kaleido go into ATP's backend
+cron). P2 settings page (+ the agent-mode switch, ATP side). P4 exits. P5 parity + screenshots. Matplotlib / plotly / kaleido go into ATP's backend
 image with P3 (the engine's charts).
