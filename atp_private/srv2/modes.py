@@ -97,3 +97,22 @@ def ensure_default(by, path=None, trading_mode_fn=None):
     if row is not None:
         return None
     return apply(HUMAN_CONFIRM, by, owner_deployment=False, path=path, trading_mode_fn=trading_mode_fn)
+
+
+CARD_FIELDS = ("signal_id", "symbol", "direction", "level", "setup_tf", "signal_ts", "created_at", "status", "verdict", "deadline",
+               "decided_at", "decided_by", "decision_reason", "executed_at", "exec_note")
+
+
+def cards(limit=50, path=None):
+    """Read-only: the bot's latest Vision cards (newest first) for ATP's card-status list - Trade's `vision_signals` rows, only the
+    display fields (no images, no Vision text, no secrets). Statuses are Trade's own: QUEUED / RUNNING / PENDING_HUMAN / APPROVED /
+    EXECUTED / REJECTED / SHADOWED / DRIFT_REJECTED / EXPIRED / DONE. An unreadable store returns [] (display only)."""
+    from atp_private.trade_engine.vision import store as VS
+    try:
+        n = max(1, min(int(limit), 500))
+        with VS.connect(path) as c:
+            rows = c.execute(f"SELECT {', '.join(CARD_FIELDS)} FROM vision_signals WHERE bot=? ORDER BY created_at DESC LIMIT ?",
+                             (BOT, n)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:                                                    # noqa: BLE001 - display only, never blocks
+        return []

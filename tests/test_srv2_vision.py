@@ -340,3 +340,22 @@ def test_the_vision_and_telegram_services_run_trades_loops_in_their_own_threads(
     assert not any(t.name.startswith("srv2-") for t in threading.enumerate())
     monkeypatch.delenv("VISION_CALLBACK_SECRET")
     assert R.telegram_service(stop, once=True) == 1                         # Trade: no secret ⇒ the service does not start
+
+
+def test_cards_lists_the_bots_cards_newest_first_read_only(env):
+    M.ensure_default("abhi", path=env.vpath)
+    store_row([entry("E1", visit="a"), entry("E2", visit="b")])
+    cycle(env)                                                              # two cards, both QUEUED
+    from atp_private.trade_engine.vision import store as VS
+    first = sorted(VS.claim_queued(path=env.vpath), key=lambda r: r["created_at"])
+    for r in first[1:]:                                                     # only the first one is decided by the worker
+        VS.transition(r["signal_id"], "RUNNING", "QUEUED", env.vpath)
+    from atp_private.trade_engine.vision import config as VC
+    from atp_private.trade_engine.vision import worker as W
+    st, extra, _d = W.v1_status(first[0], "agree", VC.load(BOT, env.vpath), {})
+    VS.finish(first[0]["signal_id"], st, env.vpath, only_from="RUNNING", final_decision=extra.pop("final", None), **extra)
+    out = M.cards(path=env.vpath)
+    assert sorted(c["status"] for c in out) == ["PENDING_HUMAN", "QUEUED"] and all(set(c) == set(M.CARD_FIELDS) for c in out)
+    assert [c["created_at"] for c in out] == sorted((c["created_at"] for c in out), reverse=True)
+    assert len(M.cards(limit=1, path=env.vpath)) == 1
+    assert M.cards(path=os.path.join(env.vpath, "not-a-dir", "vision.db")) == []   # unreadable store ⇒ [] (never raises)
