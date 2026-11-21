@@ -70,6 +70,18 @@ reads the owner's own method, so it is owner-only (ATP DECISIONS 15 Nov, chart r
   at full lots), SRV2-Q7 (plotly + kaleido must be in ATP's backend image for the card's chart photo, as this design already says; the
   card without them is not tested here). Logged in ATP docs/OPEN_QUESTIONS.md by the ATP session.
 
+## P4 (the bot's positions in ATP; exits already Trade's own, SRV2-Q1 A)
+
+- `srv2/positions.py` `read(limit=50)`: the bot's rows of Trade's own store (`live_trades`, `source = srv2_momentum_reversal`), newest
+  first, read-only (rows with SQLite `mode=ro`, legs with Trade's SELECT-only `database.get_trade_legs_with_prices`, direction with
+  Trade's `database.position_direction`). Row: id, symbol, direction, strategy, status (OPEN / CLOSED), opened_at, closed_at, legs
+  [strike, option_type, side, qty, entry_price, exit_price], pnl (stored realized P&L; none while OPEN), exit_reason, mode
+  (PAPER / LIVE). Missing / unreadable store => []; the file is never created or changed.
+- Tests `tests/test_srv2_positions.py`: open legs + fills, a closed position's exit reason / exit fills / P&L (Trade's own SL rule),
+  another bot's row left out, the file unchanged after a read, a missing or broken store returns [].
+- Not done here (need sources this session cannot read): P2 field list (Trade `page_bot_dynamic_sr_algo.py` labels / bounds, Trade
+  repo) and P5 replay (a stored day in trade-data).
+
 ## Next
 
 P1b ATP: the owner-only "SRv2 bot" deployment, the adapters (Upstox chain / expiries through the broker budget, the owner's open
